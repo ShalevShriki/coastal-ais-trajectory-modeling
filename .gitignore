@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Data files
+data/
+*.csv
+*.parquet
+*.json
+*.pkl
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Model checkpoints
+models/
+*.pt
+*.pth
+*.ckpt
+
+# Logs and outputs
+*.out
+*.log
+LOG/
+slurm_logs/
+
+# System
+.DS_Store
+.env

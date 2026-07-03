@@ -1,0 +1,10 @@
+pandas
+requests
+zstandard
+pyarrow
+matplotlib
+folium
+contextily
+pyproj
+scikit-learn
+torch
