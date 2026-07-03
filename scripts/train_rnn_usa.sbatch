@@ -23,7 +23,7 @@ echo "CUDA: $($PYTHON -c 'import torch; print(torch.cuda.get_device_name(0) if t
 
 PYTHONPATH="$PROJECT" $PYTHON -u models/RNN.py \
     --coast "USA Combined" \
-    --input data/processed/combined/train.parquet \
+    --input data/processed/combined_filtered/train.parquet \
     --sample 400000 \
     --rnn-type lstm \
     --hidden-dim 256 \
@@ -33,7 +33,7 @@ PYTHONPATH="$PROJECT" $PYTHON -u models/RNN.py \
     --epochs 60 \
     --lr 1e-3 \
     --patience 10 \
-    --horizon-hours 12.0 \
-    --filter-stationary
+    --no-maneuver-oversample \
+    --horizon-hours 12.0
 
 echo "Job ended: $(date)"

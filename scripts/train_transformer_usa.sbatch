@@ -23,7 +23,7 @@ echo "CUDA: $($PYTHON -c 'import torch; print(torch.cuda.get_device_name(0) if t
 
 PYTHONPATH="$PROJECT" $PYTHON -u models/transformers.py \
     --coast "USA Combined" \
-    --input data/processed/combined/train.parquet \
+    --input data/processed/combined_filtered/train.parquet \
     --sample 400000 \
     --d-model 128 \
     --nhead 8 \
@@ -35,7 +35,7 @@ PYTHONPATH="$PROJECT" $PYTHON -u models/transformers.py \
     --lr 1e-3 \
     --weight-decay 1e-4 \
     --patience 10 \
-    --horizon-hours 12.0 \
-    --filter-stationary
+    --no-maneuver-oversample \
+    --horizon-hours 12.0
 
 echo "Job ended: $(date)"

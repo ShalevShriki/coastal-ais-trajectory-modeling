@@ -821,6 +821,8 @@ def run_transformer(
             gradient_clip=config.gradient_clip,
         )
 
+        train_steps_cur = criterion.train_steps
+        criterion.set_train_steps(None)
         val_loss = evaluate_loss(
             model=model,
             dataloader=val_loader,
@@ -850,8 +852,8 @@ def run_transformer(
             f"valid loss {val_loss:10.6f} | "
             f"lr {current_lr:.2e}"
             + (
-                f" | steps {criterion.train_steps}/{future_steps}"
-                if training_config.curriculum and criterion.train_steps
+                f" | train steps {train_steps_cur}/{future_steps}"
+                if training_config.curriculum and train_steps_cur
                 else ""
             )
         )

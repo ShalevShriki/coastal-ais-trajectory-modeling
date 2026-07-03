@@ -25,7 +25,26 @@ def haversine_km_torch(
         torch.sin(dlat / 2) ** 2
         + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2) ** 2
     )
-    return 2 * EARTH_RADIUS_KM * torch.arcsin(torch.sqrt(a.clamp(0.0, 1.0)))
+    a = a.clamp(0.0, 1.0)
+    # atan2 formulation is more stable for autograd than arcsin(sqrt(a)).
+    return (
+        EARTH_RADIUS_KM
+        * 2.0
+        * torch.atan2(torch.sqrt(a), torch.sqrt((1.0 - a).clamp_min(1e-6)))
+    )
+
+
+def local_km_error_torch(
+    lat1: torch.Tensor,
+    lon1: torch.Tensor,
+    lat2: torch.Tensor,
+    lon2: torch.Tensor,
+) -> torch.Tensor:
+    """Stable local planar distance (km) for training; exact Haversine for eval."""
+    lat_mid = torch.deg2rad((lat1 + lat2) * 0.5)
+    dlat_km = (lat2 - lat1) * 111.322
+    dlon_km = (lon2 - lon1) * 111.322 * torch.cos(lat_mid).clamp(min=1e-3)
+    return torch.sqrt(dlat_km * dlat_km + dlon_km * dlon_km + 1e-6)
 
 
 class TrajectoryLoss(nn.Module):
@@ -64,10 +83,11 @@ class TrajectoryLoss(nn.Module):
         anchor_exp = anchor.unsqueeze(1)
         pred_abs = anchor_exp + pred_delta
         true_abs = anchor_exp + true_delta
-        dist_km = haversine_km_torch(
+        dist_km = local_km_error_torch(
             true_abs[..., 0], true_abs[..., 1], pred_abs[..., 0], pred_abs[..., 1]
         )
-        haversine = dist_km.mean(dim=1)
+        # Scale km to ~degree-scale so Huber and Haversine gradients stay balanced.
+        haversine = dist_km.mean(dim=1) / 50.0
 
         w = self.haversine_weight
         loss = (1.0 - w) * huber + w * haversine
