@@ -90,6 +90,9 @@ def load_windows(
     *,
     maneuver_oversample: bool = False,
     maneuver_fraction: float = 0.3,
+    motion_balanced_sample: bool = False,
+    straight_fraction: float = 0.15,
+    other_fraction: float = 0.15,
     seed: int = 42,
 ) -> pd.DataFrame:
     if not path.exists():
@@ -123,7 +126,15 @@ def load_windows(
     del frames
 
     if len(df) > sample_size:
-        if maneuver_oversample:
+        if motion_balanced_sample:
+            df = motion_stratified_sample(
+                df,
+                sample_size,
+                straight_fraction=straight_fraction,
+                other_fraction=other_fraction,
+                seed=seed,
+            )
+        elif maneuver_oversample:
             df = maneuver_balanced_sample(
                 df, sample_size, maneuver_fraction=maneuver_fraction, seed=seed
             )
@@ -320,6 +331,9 @@ def load_windows_filtered(
     *,
     maneuver_oversample: bool = False,
     maneuver_fraction: float = 0.3,
+    motion_balanced_sample: bool = False,
+    straight_fraction: float = 0.15,
+    other_fraction: float = 0.15,
     seed: int = 42,
 ) -> pd.DataFrame:
     df = load_windows(
@@ -327,6 +341,9 @@ def load_windows_filtered(
         sample_size=sample_size,
         maneuver_oversample=maneuver_oversample,
         maneuver_fraction=maneuver_fraction,
+        motion_balanced_sample=motion_balanced_sample,
+        straight_fraction=straight_fraction,
+        other_fraction=other_fraction,
         seed=seed,
     )
     if motion_filter is not None and motion_filter.enabled:
@@ -392,6 +409,100 @@ def maneuver_balanced_sample(
         )
         idx = np.concatenate([idx, extra])
     return df.iloc[idx[:sample_size]].reset_index(drop=True)
+
+
+def motion_bucket_masks_df(
+    df: pd.DataFrame,
+    history_steps: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Classify windows from parquet columns (same buckets as classify_window_motion)."""
+    if history_steps is None:
+        history_steps, _ = infer_window_shape(df)
+
+    sog_cols = [f"x_t{t:03d}_sog" for t in range(history_steps)]
+    dcog_cols = [f"x_t{t:03d}_dcog" for t in range(history_steps)]
+    mean_sog = df[sog_cols].to_numpy(dtype=np.float64).mean(axis=1)
+    max_dcog = np.abs(df[dcog_cols].to_numpy(dtype=np.float64)).max(axis=1)
+
+    anchored = mean_sog < 1.0
+    maneuver = max_dcog > 15.0
+    straight = (mean_sog >= 5.0) & (max_dcog < 5.0) & ~anchored
+    other = ~(anchored | maneuver | straight)
+    return {
+        "straight": straight,
+        "maneuver": maneuver,
+        "anchored": anchored,
+        "other": other,
+    }
+
+
+def motion_stratified_sample(
+    df: pd.DataFrame,
+    sample_size: int,
+    *,
+    straight_fraction: float = 0.15,
+    other_fraction: float = 0.15,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Oversample straight/other buckets; fill remainder uniformly at random."""
+    if len(df) <= sample_size:
+        return df.reset_index(drop=True)
+
+    masks = motion_bucket_masks_df(df)
+    rng = np.random.default_rng(seed)
+
+    n_straight = int(round(sample_size * straight_fraction))
+    n_other = int(round(sample_size * other_fraction))
+
+    def pick(mask: np.ndarray, n: int) -> np.ndarray:
+        if n <= 0:
+            return np.array([], dtype=int)
+        pool = np.flatnonzero(mask)
+        if len(pool) == 0:
+            return np.array([], dtype=int)
+        return rng.choice(pool, size=n, replace=len(pool) < n)
+
+    parts = [
+        pick(masks["straight"], n_straight),
+        pick(masks["other"], n_other),
+    ]
+    chosen = np.unique(np.concatenate([p for p in parts if len(p)]))
+    if len(chosen) < sample_size:
+        pool = np.setdiff1d(np.arange(len(df)), chosen)
+        need = sample_size - len(chosen)
+        if len(pool) > 0:
+            extra = rng.choice(pool, size=need, replace=len(pool) < need)
+            chosen = np.unique(np.concatenate([chosen, extra]))
+
+    out = df.iloc[chosen[:sample_size]].reset_index(drop=True)
+    picked_masks = motion_bucket_masks_df(out)
+    print(
+        "Motion-stratified sample: "
+        f"straight={int(picked_masks['straight'].sum()):,} "
+        f"maneuver={int(picked_masks['maneuver'].sum()):,} "
+        f"anchored={int(picked_masks['anchored'].sum()):,} "
+        f"other={int(picked_masks['other'].sum()):,} "
+        f"(requested straight/other frac {straight_fraction:.0%}/{other_fraction:.0%})"
+    )
+    return out
+
+
+def compute_naive_cumulative_delta(
+    x: np.ndarray,
+    future_steps: int,
+    feature_cols: list[str] | None = None,
+) -> np.ndarray:
+    """Constant-velocity cumulative offset from anchor for each future step."""
+    cols = feature_cols or FEATURE_COLS
+    dlat_idx = feature_index(cols, "dlat")
+    dlon_idx = feature_index(cols, "dlon")
+    dlat = x[:, -1, dlat_idx].astype(np.float32)
+    dlon = x[:, -1, dlon_idx].astype(np.float32)
+    steps = np.arange(1, future_steps + 1, dtype=np.float32)
+    return np.stack(
+        [dlat[:, np.newaxis] * steps[np.newaxis, :], dlon[:, np.newaxis] * steps[np.newaxis, :]],
+        axis=-1,
+    )
 
 
 def compute_sample_weights(

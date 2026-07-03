@@ -104,11 +104,76 @@ class TrainingImprovementConfig:
     difficulty_weighting: bool = True
     maneuver_oversample: bool = True
     maneuver_fraction: float = 0.3
+    motion_balanced_sample: bool = False
+    straight_fraction: float = 0.15
+    other_fraction: float = 0.15
+    residual_naive: bool = False
     curriculum: bool = True
     curriculum_start_hours: float = 6.0
     scheduled_teacher_forcing: bool = True
     teacher_forcing_start: float = 0.3
     teacher_forcing_end: float = 0.0
+
+
+def apply_residual_prediction(
+    pred: torch.Tensor,
+    naive_delta: torch.Tensor | None,
+    *,
+    residual: bool,
+) -> torch.Tensor:
+    if residual and naive_delta is not None:
+        return pred + naive_delta
+    return pred
+
+
+def unpack_window_batch(
+    batch: tuple,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Return x, y_delta, anchor, naive_delta (optional), sample_weight (optional)."""
+    if len(batch) == 5:
+        batch_x, batch_y_delta, batch_anchor, batch_naive, batch_weight = batch
+        return (
+            batch_x.to(device),
+            batch_y_delta.to(device),
+            batch_anchor.to(device),
+            batch_naive.to(device),
+            batch_weight.to(device),
+        )
+    if len(batch) == 4:
+        batch_x, batch_y_delta, batch_anchor, fourth = batch
+        batch_x = batch_x.to(device)
+        batch_y_delta = batch_y_delta.to(device)
+        batch_anchor = batch_anchor.to(device)
+        if fourth.dim() == 1:
+            return batch_x, batch_y_delta, batch_anchor, None, fourth.to(device)
+        return batch_x, batch_y_delta, batch_anchor, fourth.to(device), None
+    batch_x, batch_y_delta, batch_anchor = batch
+    return (
+        batch_x.to(device),
+        batch_y_delta.to(device),
+        batch_anchor.to(device),
+        None,
+        None,
+    )
+
+
+def training_improvements_dict(config: TrainingImprovementConfig) -> dict:
+    return {
+        "haversine_weight": config.haversine_weight,
+        "difficulty_weighting": config.difficulty_weighting,
+        "maneuver_oversample": config.maneuver_oversample,
+        "maneuver_fraction": config.maneuver_fraction,
+        "motion_balanced_sample": config.motion_balanced_sample,
+        "straight_fraction": config.straight_fraction,
+        "other_fraction": config.other_fraction,
+        "residual_naive": config.residual_naive,
+        "curriculum": config.curriculum,
+        "curriculum_start_hours": config.curriculum_start_hours,
+        "scheduled_teacher_forcing": config.scheduled_teacher_forcing,
+        "teacher_forcing_start": config.teacher_forcing_start,
+        "teacher_forcing_end": config.teacher_forcing_end,
+    }
 
 
 def scheduled_teacher_forcing(
@@ -160,6 +225,28 @@ def add_training_improvement_args(parser) -> None:
         help="Disable 30%% maneuver-biased sampling when subsampling windows.",
     )
     parser.add_argument(
+        "--motion-balanced-sample",
+        action="store_true",
+        help="Oversample straight/other motion buckets when subsampling windows.",
+    )
+    parser.add_argument(
+        "--straight-fraction",
+        type=float,
+        default=0.15,
+        help="Target fraction of straight windows in motion-balanced sample (default 0.15).",
+    )
+    parser.add_argument(
+        "--other-fraction",
+        type=float,
+        default=0.15,
+        help="Target fraction of 'other' windows in motion-balanced sample (default 0.15).",
+    )
+    parser.add_argument(
+        "--residual-naive",
+        action="store_true",
+        help="Predict correction to constant-velocity naive trajectory.",
+    )
+    parser.add_argument(
         "--maneuver-fraction",
         type=float,
         default=0.3,
@@ -189,6 +276,10 @@ def training_config_from_args(args) -> TrainingImprovementConfig:
         difficulty_weighting=not getattr(args, "no_difficulty_weighting", False),
         maneuver_oversample=not getattr(args, "no_maneuver_oversample", False),
         maneuver_fraction=getattr(args, "maneuver_fraction", 0.3),
+        motion_balanced_sample=getattr(args, "motion_balanced_sample", False),
+        straight_fraction=getattr(args, "straight_fraction", 0.15),
+        other_fraction=getattr(args, "other_fraction", 0.15),
+        residual_naive=getattr(args, "residual_naive", False),
         curriculum=not getattr(args, "no_curriculum", False),
         curriculum_start_hours=getattr(args, "curriculum_start_hours", 6.0),
         scheduled_teacher_forcing=not getattr(args, "no_scheduled_tf", False),

@@ -19,6 +19,7 @@ from proj.project.coast_paths import COAST_CONFIGS, models_output_dir, resolve_w
 from proj.project.window_data import (
     FEATURE_COLS,
     build_window_arrays,
+    compute_naive_cumulative_delta,
     compute_sample_weights,
     evaluate_final_position,
     evaluate_full_trajectory,
@@ -40,9 +41,12 @@ from proj.project.models.training_utils import (
     TrajectoryLoss,
     TrainingImprovementConfig,
     add_training_improvement_args,
+    apply_residual_prediction,
     curriculum_train_steps,
     scheduled_teacher_forcing,
     training_config_from_args,
+    training_improvements_dict,
+    unpack_window_batch,
 )
 
 
@@ -81,6 +85,7 @@ class WindowDataset(Dataset):
         y_delta: np.ndarray,
         anchor: np.ndarray,
         sample_weights: np.ndarray | None = None,
+        naive_delta: np.ndarray | None = None,
     ):
         self.x = torch.tensor(x, dtype=torch.float32)
         self.y_delta = torch.tensor(y_delta, dtype=torch.float32)
@@ -90,14 +95,22 @@ class WindowDataset(Dataset):
             if sample_weights is not None
             else None
         )
+        self.naive_delta = (
+            torch.tensor(naive_delta, dtype=torch.float32)
+            if naive_delta is not None
+            else None
+        )
 
     def __len__(self) -> int:
         return len(self.x)
 
     def __getitem__(self, idx: int):
-        if self.sample_weights is None:
-            return self.x[idx], self.y_delta[idx], self.anchor[idx]
-        return self.x[idx], self.y_delta[idx], self.anchor[idx], self.sample_weights[idx]
+        items = [self.x[idx], self.y_delta[idx], self.anchor[idx]]
+        if self.naive_delta is not None:
+            items.append(self.naive_delta[idx])
+        if self.sample_weights is not None:
+            items.append(self.sample_weights[idx])
+        return tuple(items)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +238,8 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     teacher_forcing_ratio: float,
+    *,
+    residual_naive: bool = False,
 ) -> float:
     model.train()
 
@@ -232,21 +247,20 @@ def train_one_epoch(
     total_count = 0
 
     for batch in dataloader:
-        if len(batch) == 4:
-            batch_x, batch_y_delta, batch_anchor, batch_weight = batch
-            batch_weight = batch_weight.to(device)
-        else:
-            batch_x, batch_y_delta, batch_anchor = batch
-            batch_weight = None
-
-        batch_x = batch_x.to(device)
-        batch_y_delta = batch_y_delta.to(device)
-        batch_anchor = batch_anchor.to(device)
+        batch_x, batch_y_delta, batch_anchor, batch_naive, batch_weight = unpack_window_batch(
+            batch, device
+        )
+        tf_target = batch_y_delta
+        if residual_naive and batch_naive is not None:
+            tf_target = batch_y_delta - batch_naive
 
         y_hat_delta = model(
             batch_x,
-            target=batch_y_delta,
+            target=tf_target,
             teacher_forcing_ratio=teacher_forcing_ratio,
+        )
+        y_hat_delta = apply_residual_prediction(
+            y_hat_delta, batch_naive, residual=residual_naive
         )
         if isinstance(criterion, TrajectoryLoss):
             loss = criterion(y_hat_delta, batch_y_delta, batch_anchor, batch_weight)
@@ -271,6 +285,8 @@ def evaluate_loss(
     dataloader: DataLoader,
     criterion,
     device: torch.device,
+    *,
+    residual_naive: bool = False,
 ) -> float:
     model.eval()
 
@@ -278,18 +294,14 @@ def evaluate_loss(
     total_count = 0
 
     for batch in dataloader:
-        if len(batch) == 4:
-            batch_x, batch_y_delta, batch_anchor, batch_weight = batch
-            batch_weight = batch_weight.to(device)
-        else:
-            batch_x, batch_y_delta, batch_anchor = batch
-            batch_weight = None
-
-        batch_x = batch_x.to(device)
-        batch_y_delta = batch_y_delta.to(device)
-        batch_anchor = batch_anchor.to(device)
+        batch_x, batch_y_delta, batch_anchor, batch_naive, batch_weight = unpack_window_batch(
+            batch, device
+        )
 
         y_hat_delta = model(batch_x)
+        y_hat_delta = apply_residual_prediction(
+            y_hat_delta, batch_naive, residual=residual_naive
+        )
         if isinstance(criterion, TrajectoryLoss):
             loss = criterion(y_hat_delta, batch_y_delta, batch_anchor, batch_weight)
         else:
@@ -307,18 +319,27 @@ def predict_absolute_positions(
     model: ShipTrajectoryARRNN,
     dataloader: DataLoader,
     device: torch.device,
+    *,
+    residual_naive: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
 
     y_true_list = []
     y_pred_list = []
 
-    for batch_x, batch_y_delta, batch_anchor in dataloader:
-        batch_x = batch_x.to(device)
+    for batch in dataloader:
+        batch_x, batch_y_delta, batch_anchor, batch_naive, _ = unpack_window_batch(
+            batch, device
+        )
 
-        y_hat_delta = model(batch_x).cpu().numpy()
-        y_true_delta = batch_y_delta.numpy()
-        anchor = batch_anchor.numpy()[:, np.newaxis, :]
+        y_hat_delta = model(batch_x)
+        y_hat_delta = apply_residual_prediction(
+            y_hat_delta, batch_naive, residual=residual_naive
+        )
+
+        y_hat_delta = y_hat_delta.cpu().numpy()
+        y_true_delta = batch_y_delta.cpu().numpy()
+        anchor = batch_anchor.cpu().numpy()[:, np.newaxis, :]
 
         y_true_abs = anchor + y_true_delta
         y_pred_abs = anchor + y_hat_delta
@@ -467,6 +488,9 @@ def run_rnn_ar(
         motion_filter=motion_filter,
         maneuver_oversample=training_config.maneuver_oversample,
         maneuver_fraction=training_config.maneuver_fraction,
+        motion_balanced_sample=training_config.motion_balanced_sample,
+        straight_fraction=training_config.straight_fraction,
+        other_fraction=training_config.other_fraction,
         seed=seed,
     )
 
@@ -490,6 +514,8 @@ def run_rnn_ar(
         history_steps=history_steps,
         future_steps=future_steps,
     )
+    naive_delta = compute_naive_cumulative_delta(x, future_steps)
+    naive_for_dataset = naive_delta if training_config.residual_naive else None
 
     if "traj_id" in df.columns:
         num_trajectories = df["traj_id"].nunique()
@@ -544,14 +570,20 @@ def run_rnn_ar(
         else None
     )
 
+    naive_train = naive_delta[train_mask] if naive_for_dataset is not None else None
+    naive_val = naive_delta[val_mask] if naive_for_dataset is not None else None
+    naive_test = naive_delta[test_mask] if naive_for_dataset is not None else None
+
     x_train, [x_val, x_test], scaler = scale_history_features(
         x_train,
         [x_val, x_test],
     )
 
-    train_dataset = WindowDataset(x_train, y_delta_train, anchor_train, train_weights)
-    val_dataset   = WindowDataset(x_val,   y_delta_val,   anchor_val)
-    test_dataset  = WindowDataset(x_test,  y_delta_test,  anchor_test)
+    train_dataset = WindowDataset(
+        x_train, y_delta_train, anchor_train, train_weights, naive_train
+    )
+    val_dataset = WindowDataset(x_val, y_delta_val, anchor_val, None, naive_val)
+    test_dataset = WindowDataset(x_test, y_delta_test, anchor_test, None, naive_test)
 
     if len(train_dataset) == 0:
         raise ValueError("No training windows found. Run preprocessing first or lower split fractions.")
@@ -603,7 +635,9 @@ def run_rnn_ar(
     base_tf = teacher_forcing_ratio
     print(
         f"Loss: Huber + Haversine (w={training_config.haversine_weight:.2f}) | "
-        f"TF start={base_tf:.2f} scheduled={'on' if training_config.scheduled_teacher_forcing else 'off'}"
+        f"TF start={base_tf:.2f} scheduled={'on' if training_config.scheduled_teacher_forcing else 'off'} | "
+        f"residual naive={'on' if training_config.residual_naive else 'off'} | "
+        f"motion sample={'balanced' if training_config.motion_balanced_sample else 'uniform'}"
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -665,6 +699,7 @@ def run_rnn_ar(
             optimizer=optimizer,
             device=device,
             teacher_forcing_ratio=epoch_tf,
+            residual_naive=training_config.residual_naive,
         )
 
         train_steps_cur = criterion.train_steps
@@ -674,6 +709,7 @@ def run_rnn_ar(
             dataloader=val_loader,
             criterion=criterion,
             device=device,
+            residual_naive=training_config.residual_naive,
         )
 
         scheduler.step(val_loss)
@@ -742,6 +778,7 @@ def run_rnn_ar(
         model=model,
         dataloader=test_loader,
         device=device,
+        residual_naive=training_config.residual_naive,
     )
 
     # Save sample trajectories for map visualisation in the comparison script.
@@ -858,6 +895,7 @@ def run_rnn_ar(
             "patience": patience,
             "best_val_loss": float(best_val_loss),
             "device": str(device),
+            "improvements": training_improvements_dict(training_config),
         },
         "splits": {
             "test_fraction": test_fraction,
