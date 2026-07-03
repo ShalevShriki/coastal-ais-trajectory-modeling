@@ -1,0 +1,201 @@
+{
+  "input": "data/processed/Eastern coast/ais_west_coast_4d_long_horizon/model_ready_windows.parquet",
+  "coast": "Eastern coast",
+  "days_label": "4 dey",
+  "region": "west_coast",
+  "samples_total": 147266,
+  "samples_train": 103080,
+  "samples_val": 14414,
+  "samples_test": 29772,
+  "features": [
+    "lat",
+    "lon",
+    "sog",
+    "cog_sin",
+    "cog_cos",
+    "heading_sin",
+    "heading_cos",
+    "heading_missing",
+    "dt_sec",
+    "dlat",
+    "dlon",
+    "dsog",
+    "dcog",
+    "v_north_kmh",
+    "v_east_kmh"
+  ],
+  "history_steps": 144,
+  "future_steps": 72,
+  "window_hours": 12.0,
+  "horizon_hours_requested": 12.0,
+  "horizon_hours_actual": 12.0,
+  "horizon_step_index": 71,
+  "architecture": {
+    "type": "lstm",
+    "hidden_dim": 256,
+    "num_layers": 2,
+    "dropout": 0.2
+  },
+  "training": {
+    "batch_size": 256,
+    "epochs_ran": 15,
+    "learning_rate": 0.001,
+    "patience": 10,
+    "best_val_loss": 0.0005255384678176459,
+    "device": "cuda"
+  },
+  "splits": {
+    "test_fraction": 0.2,
+    "val_fraction": 0.1,
+    "seed": 42,
+    "split_by": "trajectory"
+  },
+  "compute": {
+    "param_count": 908688,
+    "peak_gpu_mb": 771.70751953125,
+    "avg_throughput_samples_per_sec": 15099.83212820634,
+    "total_train_sec": 102.39848939192598
+  },
+  "metrics": [
+    {
+      "model": "Naive baseline: constant last-step delta",
+      "mae_lat": 0.07585392892360687,
+      "mae_lon": 0.12394232302904129,
+      "rmse_lat": 0.29859012365341187,
+      "rmse_lon": 0.37563949823379517,
+      "r2_lat": 0.9977385092218781,
+      "r2_lon": 0.9682130855021736,
+      "mean_error_nm": 7.89159631729126,
+      "median_error_nm": 0.11577624082565308,
+      "p90_error_nm": 23.150222206115735,
+      "p95_error_nm": 44.33783092498775
+    },
+    {
+      "model": "LSTM trajectory model: position (12.0 h ahead)",
+      "mae_lat": 0.05669119581580162,
+      "mae_lon": 0.10411756485700607,
+      "rmse_lat": 0.17583067715168,
+      "rmse_lon": 0.34690943360328674,
+      "r2_lat": 0.999215788453007,
+      "r2_lon": 0.9728894641347667,
+      "mean_error_nm": 6.274721145629883,
+      "median_error_nm": 0.0444205179810524,
+      "p90_error_nm": 18.79974231719971,
+      "p95_error_nm": 39.72567119598384
+    },
+    {
+      "model": "LSTM trajectory model: full predicted trajectory",
+      "mean_ade_nm": 3.3157782554626465,
+      "median_ade_nm": 0.03618519753217697,
+      "final_step_mean_error_nm": 6.274721145629883
+    }
+  ],
+  "history": [
+    {
+      "epoch": 0,
+      "train_loss": 0.000431360050033092,
+      "val_loss": 0.0005311464462224046,
+      "lr": 0.001,
+      "epoch_sec": 7.50568575199577
+    },
+    {
+      "epoch": 1,
+      "train_loss": 0.0003910268853487375,
+      "val_loss": 0.0005365898654073334,
+      "lr": 0.001,
+      "epoch_sec": 6.734407205978641
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.00037490039517966395,
+      "val_loss": 0.0005400077998188463,
+      "lr": 0.001,
+      "epoch_sec": 6.746698643983109
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.000361781056851458,
+      "val_loss": 0.0005387606758722894,
+      "lr": 0.001,
+      "epoch_sec": 6.807925166998757
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.0003492473659702267,
+      "val_loss": 0.0005255384678176459,
+      "lr": 0.001,
+      "epoch_sec": 6.740482647990575
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.0003356448935804152,
+      "val_loss": 0.0005294151539622787,
+      "lr": 0.001,
+      "epoch_sec": 6.828071563009871
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.00033906803943967065,
+      "val_loss": 0.0005278988862560586,
+      "lr": 0.001,
+      "epoch_sec": 6.761750061996281
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.00032291898694446653,
+      "val_loss": 0.0005276176864233707,
+      "lr": 0.001,
+      "epoch_sec": 6.787156029022299
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.0003038865413540612,
+      "val_loss": 0.0005538695772126669,
+      "lr": 0.0005,
+      "epoch_sec": 6.772975042986218
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.0002826599670904929,
+      "val_loss": 0.0005420977906346298,
+      "lr": 0.0005,
+      "epoch_sec": 6.794086176989367
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.00027131569726697284,
+      "val_loss": 0.0005480389339566058,
+      "lr": 0.0005,
+      "epoch_sec": 6.783742913015885
+    },
+    {
+      "epoch": 11,
+      "train_loss": 0.0002630073412232604,
+      "val_loss": 0.0005569482939845213,
+      "lr": 0.0005,
+      "epoch_sec": 6.771972320973873
+    },
+    {
+      "epoch": 12,
+      "train_loss": 0.00025660571665981935,
+      "val_loss": 0.0005699155961533916,
+      "lr": 0.00025,
+      "epoch_sec": 6.7754230340069626
+    },
+    {
+      "epoch": 13,
+      "train_loss": 0.00024405073823185395,
+      "val_loss": 0.0005667770098331319,
+      "lr": 0.00025,
+      "epoch_sec": 6.800620485999389
+    },
+    {
+      "epoch": 14,
+      "train_loss": 0.0002397105151618989,
+      "val_loss": 0.0005777956878744778,
+      "lr": 0.00025,
+      "epoch_sec": 6.787492346978979
+    }
+  ],
+  "runtime_sec": 113.28
+}

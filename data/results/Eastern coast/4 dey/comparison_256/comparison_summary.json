@@ -1,0 +1,76 @@
+{
+  "dataset": {
+    "coast": "Eastern coast",
+    "region": "west_coast",
+    "horizon_hours_actual": 12.0,
+    "samples_test": 29772
+  },
+  "flat_head": {
+    "metrics_position": {
+      "model": "LSTM trajectory model: position (12.0 h ahead)",
+      "mae_lat": 0.05669119581580162,
+      "mae_lon": 0.10411756485700607,
+      "rmse_lat": 0.17583067715168,
+      "rmse_lon": 0.34690943360328674,
+      "r2_lat": 0.999215788453007,
+      "r2_lon": 0.9728894641347667,
+      "mean_error_nm": 6.274721145629883,
+      "median_error_nm": 0.0444205179810524,
+      "p90_error_nm": 18.79974231719971,
+      "p95_error_nm": 39.72567119598384
+    },
+    "metrics_trajectory": {
+      "model": "LSTM trajectory model: full predicted trajectory",
+      "mean_ade_nm": 3.3157782554626465,
+      "median_ade_nm": 0.03618519753217697,
+      "final_step_mean_error_nm": 6.274721145629883
+    },
+    "compute": {
+      "param_count": 908688,
+      "peak_gpu_mb": 771.70751953125,
+      "avg_throughput_samples_per_sec": 15099.83212820634,
+      "total_train_sec": 102.39848939192598
+    },
+    "epochs_ran": 15,
+    "best_val_loss": 0.0005255384678176459
+  },
+  "autoregressive": {
+    "metrics_position": {
+      "model": "LSTM-AR trajectory model: position (12.0 h ahead)",
+      "mae_lat": 0.06525792181491852,
+      "mae_lon": 0.11319908499717712,
+      "rmse_lat": 0.21272976696491241,
+      "rmse_lon": 0.37908926606178284,
+      "r2_lat": 0.9988521094457341,
+      "r2_lon": 0.9676265624889409,
+      "mean_error_nm": 7.003430366516113,
+      "median_error_nm": 0.017056690528988838,
+      "p90_error_nm": 20.11671390533448,
+      "p95_error_nm": 42.61113567352263
+    },
+    "metrics_trajectory": {
+      "model": "LSTM-AR trajectory model: full predicted trajectory",
+      "mean_ade_nm": 3.528775453567505,
+      "median_ade_nm": 0.014266069047152996,
+      "final_step_mean_error_nm": 7.003430366516113
+    },
+    "compute": {
+      "param_count": 1631618,
+      "peak_gpu_mb": 804.21337890625,
+      "avg_throughput_samples_per_sec": 2663.9692359078963,
+      "total_train_sec": 1547.7656214730232
+    },
+    "epochs_ran": 40,
+    "best_val_loss": 0.0005205229105669159,
+    "teacher_forcing_ratio": 0.5
+  },
+  "ar_vs_flat_delta_pct": {
+    "mean_error_nm": 11.61,
+    "median_error_nm": -61.6,
+    "p90_error_nm": 7.01,
+    "mean_ade_nm": 6.42,
+    "param_overhead": 79.56,
+    "gpu_overhead": 4.21,
+    "throughput_drop": -82.36
+  }
+}

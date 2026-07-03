@@ -1,0 +1,106 @@
+{
+  "input": "data/processed/Eastern coast/ais_east_coast_4d_long_horizon/model_ready_windows.parquet",
+  "coast": "Eastern coast",
+  "days_label": "4 dey",
+  "region": "east_coast",
+  "samples_total": 500,
+  "samples_train": 349,
+  "samples_val": 49,
+  "samples_test": 102,
+  "features": [
+    "lat",
+    "lon",
+    "sog",
+    "cog_sin",
+    "cog_cos",
+    "heading_sin",
+    "heading_cos",
+    "heading_missing",
+    "dt_sec",
+    "dlat",
+    "dlon",
+    "dsog",
+    "dcog",
+    "v_north_kmh",
+    "v_east_kmh"
+  ],
+  "history_steps": 144,
+  "future_steps": 72,
+  "window_hours": 12.0,
+  "horizon_hours_requested": 1.0,
+  "horizon_hours_actual": 1.0,
+  "horizon_step_index": 5,
+  "architecture": {
+    "type": "transformer",
+    "d_model": 128,
+    "nhead": 8,
+    "num_encoder_layers": 4,
+    "dim_feedforward": 512,
+    "dropout": 0.1
+  },
+  "training": {
+    "batch_size": 64,
+    "epochs_ran": 1,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "patience": 1,
+    "best_val_loss": 0.0010702909203246236,
+    "device": "cuda"
+  },
+  "splits": {
+    "test_fraction": 0.2,
+    "val_fraction": 0.1,
+    "seed": 42,
+    "split_by": "trajectory"
+  },
+  "compute": {
+    "param_count": 1002000,
+    "peak_gpu_mb": 411.97119140625,
+    "avg_throughput_samples_per_sec": 559.6381407389363,
+    "total_train_sec": 0.6236172529970645
+  },
+  "metrics": [
+    {
+      "model": "Naive baseline: constant last-step delta",
+      "mae_lat": 0.016749177128076553,
+      "mae_lon": 0.01950484700500965,
+      "rmse_lat": 0.042241375893354416,
+      "rmse_lon": 0.05055719614028931,
+      "r2_lat": 0.9995413425630976,
+      "r2_lon": 0.9993507317821054,
+      "mean_error_nm": 1.4600807428359985,
+      "median_error_nm": 0.01721370778977871,
+      "p90_error_nm": 5.441824436187749,
+      "p95_error_nm": 8.356689000129695
+    },
+    {
+      "model": "Transformer trajectory model: position (1.0 h ahead)",
+      "mae_lat": 0.13819627463817596,
+      "mae_lon": 0.08950835466384888,
+      "rmse_lat": 0.15135347843170166,
+      "rmse_lon": 0.10277945548295975,
+      "r2_lat": 0.9941116036101806,
+      "r2_lon": 0.9973166901428241,
+      "mean_error_nm": 9.797344207763672,
+      "median_error_nm": 9.844718933105469,
+      "p90_error_nm": 12.329693031311034,
+      "p95_error_nm": 13.36756291389465
+    },
+    {
+      "model": "Transformer trajectory model: full predicted trajectory",
+      "mean_ade_nm": 11.300874710083008,
+      "median_ade_nm": 7.2224507331848145,
+      "final_step_mean_error_nm": 15.598919868469238
+    }
+  ],
+  "history": [
+    {
+      "epoch": 0,
+      "train_loss": 0.0027875212907796476,
+      "val_loss": 0.0010702909203246236,
+      "lr": 0.001,
+      "epoch_sec": 0.6236172529970645
+    }
+  ],
+  "runtime_sec": 10.74
+}

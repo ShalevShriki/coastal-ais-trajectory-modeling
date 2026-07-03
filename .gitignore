@@ -7,11 +7,15 @@ __pycache__/
 dist/
 build/
 
-# Data files
-data/
+# Data files (raw processed data stays out of git)
+data/*
+!data/results/
+!data/results/**
+data/results/**/*.log
 *.csv
 *.parquet
 *.json
+!data/results/**/*.json
 *.pkl
 *.npy
 *.npz

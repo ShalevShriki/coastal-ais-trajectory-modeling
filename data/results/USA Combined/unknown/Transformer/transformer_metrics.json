@@ -1,0 +1,255 @@
+{
+  "input": "data/processed/combined/train.parquet",
+  "coast": "USA Combined",
+  "days_label": "unknown",
+  "region": "usa_combined",
+  "samples_total": 271349,
+  "samples_train": 191837,
+  "samples_val": 25754,
+  "samples_test": 53758,
+  "features": [
+    "lat",
+    "lon",
+    "sog",
+    "cog_sin",
+    "cog_cos",
+    "heading_sin",
+    "heading_cos",
+    "heading_missing",
+    "dt_sec",
+    "dlat",
+    "dlon",
+    "dsog",
+    "dcog",
+    "v_north_kmh",
+    "v_east_kmh"
+  ],
+  "history_steps": 144,
+  "future_steps": 72,
+  "window_hours": 12.0,
+  "horizon_hours_requested": 12.0,
+  "horizon_hours_actual": 12.0,
+  "horizon_step_index": 71,
+  "architecture": {
+    "type": "transformer",
+    "d_model": 128,
+    "nhead": 8,
+    "num_encoder_layers": 4,
+    "dim_feedforward": 512,
+    "dropout": 0.1
+  },
+  "training": {
+    "batch_size": 128,
+    "epochs_ran": 11,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "patience": 10,
+    "best_val_loss": 3.636967150961528,
+    "device": "cuda"
+  },
+  "splits": {
+    "test_fraction": 0.2,
+    "val_fraction": 0.1,
+    "seed": 42,
+    "split_by": "trajectory"
+  },
+  "compute": {
+    "param_count": 1002000,
+    "peak_gpu_mb": 792.4453125,
+    "avg_throughput_samples_per_sec": 4019.978267482971,
+    "total_train_sec": 524.9299522510264
+  },
+  "metrics": [
+    {
+      "model": "Naive baseline: constant last-step delta",
+      "mae_lat": 0.25418922305107117,
+      "mae_lon": 0.281272828578949,
+      "rmse_lat": 0.8417233228683472,
+      "rmse_lon": 1.2916570901870728,
+      "r2_lat": 0.9741744388782293,
+      "r2_lon": 0.9781525365527347,
+      "mean_error_km": 42.71739196777344,
+      "median_error_km": 7.7775421142578125,
+      "p90_error_km": 118.8025604248048,
+      "p95_error_km": 190.37939453124966,
+      "mean_error_nm": 23.065547943115234,
+      "median_error_nm": 4.1995368003845215,
+      "p90_error_nm": 64.14825210571294,
+      "p95_error_nm": 102.79664726257306
+    },
+    {
+      "model": "Transformer trajectory model: position (12.0 h ahead)",
+      "mae_lat": 0.2580971419811249,
+      "mae_lon": 0.2323235273361206,
+      "rmse_lat": 0.6070155501365662,
+      "rmse_lon": 0.503216028213501,
+      "r2_lat": 0.9865689255706133,
+      "r2_lon": 0.9966839921655729,
+      "mean_error_km": 39.67802047729492,
+      "median_error_km": 5.68142557144165,
+      "p90_error_km": 124.00301361083989,
+      "p95_error_km": 201.19065780639644,
+      "mean_error_nm": 21.424415588378906,
+      "median_error_nm": 3.0677242279052734,
+      "p90_error_nm": 66.95627365112307,
+      "p95_error_nm": 108.63426742553708
+    },
+    {
+      "model": "Transformer trajectory model: full predicted trajectory",
+      "mean_ade_km": 18.11029052734375,
+      "median_ade_km": 1.6548571586608887,
+      "final_step_mean_error_km": 39.67802047729492,
+      "mean_ade_nm": 9.778776168823242,
+      "median_ade_nm": 0.8935514092445374,
+      "final_step_mean_error_nm": 21.424415588378906
+    },
+    {
+      "model": "Transformer trajectory model: position (12.0 h ahead) [straight, n=370]",
+      "mae_lat": 1.163248896598816,
+      "mae_lon": 0.9267762899398804,
+      "rmse_lat": 1.429441213607788,
+      "rmse_lon": 1.1928633451461792,
+      "r2_lat": 0.917622178540398,
+      "r2_lon": 0.9363802868610636,
+      "mean_error_km": 167.10052490234375,
+      "median_error_km": 168.6855010986328,
+      "p90_error_km": 290.8653045654297,
+      "p95_error_km": 355.1729125976565,
+      "mean_error_nm": 90.22705841064453,
+      "median_error_nm": 91.0828857421875,
+      "p90_error_nm": 157.05469360351563,
+      "p95_error_nm": 191.77803039550793
+    },
+    {
+      "model": "Transformer trajectory model: position (12.0 h ahead) [maneuver, n=48906]",
+      "mae_lat": 0.23653064668178558,
+      "mae_lon": 0.21717175841331482,
+      "rmse_lat": 0.5834989547729492,
+      "rmse_lon": 0.48445621132850647,
+      "r2_lat": 0.9874896218860619,
+      "r2_lon": 0.9969763087059395,
+      "mean_error_km": 36.73617935180664,
+      "median_error_km": 4.690028190612793,
+      "p90_error_km": 112.07772445678711,
+      "p95_error_km": 190.22122192382812,
+      "mean_error_nm": 19.835948944091797,
+      "median_error_nm": 2.532412528991699,
+      "p90_error_nm": 60.51712989807129,
+      "p95_error_nm": 102.71124458312988
+    },
+    {
+      "model": "Transformer trajectory model: position (12.0 h ahead) [anchored, n=18492]",
+      "mae_lat": 0.160727396607399,
+      "mae_lon": 0.16578714549541473,
+      "rmse_lat": 0.40374666452407837,
+      "rmse_lon": 0.40112897753715515,
+      "r2_lat": 0.9944247916102051,
+      "r2_lon": 0.9979623962850735,
+      "mean_error_km": 25.69359016418457,
+      "median_error_km": 1.5178115367889404,
+      "p90_error_km": 87.81427841186535,
+      "p95_error_km": 143.33624496459962,
+      "mean_error_nm": 13.873428344726562,
+      "median_error_nm": 0.8195526599884033,
+      "p90_error_nm": 47.415916061401425,
+      "p95_error_nm": 77.39538078308105
+    },
+    {
+      "model": "Transformer trajectory model: position (12.0 h ahead) [other, n=1904]",
+      "mae_lat": 0.5665552020072937,
+      "mae_lon": 0.41551080346107483,
+      "rmse_lat": 0.9110938906669617,
+      "rmse_lon": 0.7081203460693359,
+      "r2_lat": 0.9638391478360326,
+      "r2_lon": 0.9900454673662242,
+      "mean_error_km": 80.67351531982422,
+      "median_error_km": 50.70872497558594,
+      "p90_error_km": 224.1196762084961,
+      "p95_error_km": 269.0619537353515,
+      "mean_error_nm": 43.560211181640625,
+      "median_error_nm": 27.38051986694336,
+      "p90_error_nm": 121.01494216918945,
+      "p95_error_nm": 145.28182983398435
+    }
+  ],
+  "history": [
+    {
+      "epoch": 0,
+      "train_loss": 11.106419523110649,
+      "val_loss": 3.636967150961528,
+      "lr": 0.001,
+      "epoch_sec": 49.25403092103079
+    },
+    {
+      "epoch": 1,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.001,
+      "epoch_sec": 47.79030345007777
+    },
+    {
+      "epoch": 2,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.001,
+      "epoch_sec": 47.73114915005863
+    },
+    {
+      "epoch": 3,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.001,
+      "epoch_sec": 47.508696236880496
+    },
+    {
+      "epoch": 4,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.0005,
+      "epoch_sec": 47.4742252191063
+    },
+    {
+      "epoch": 5,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.0005,
+      "epoch_sec": 47.52937438385561
+    },
+    {
+      "epoch": 6,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.0005,
+      "epoch_sec": 47.56102254381403
+    },
+    {
+      "epoch": 7,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.0005,
+      "epoch_sec": 47.429197875084355
+    },
+    {
+      "epoch": 8,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.00025,
+      "epoch_sec": 47.51263850508258
+    },
+    {
+      "epoch": 9,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.00025,
+      "epoch_sec": 47.539406238123775
+    },
+    {
+      "epoch": 10,
+      "train_loss": NaN,
+      "val_loss": NaN,
+      "lr": 0.00025,
+      "epoch_sec": 47.59990772791207
+    }
+  ],
+  "runtime_sec": 658.68
+}
