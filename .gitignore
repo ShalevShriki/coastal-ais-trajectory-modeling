@@ -18,8 +18,8 @@ data/
 *.h5
 *.hdf5
 
-# Model checkpoints
-models/
+# Model checkpoints (binary weights only — Python source in models/ is tracked)
+data/models/
 *.pt
 *.pth
 *.ckpt

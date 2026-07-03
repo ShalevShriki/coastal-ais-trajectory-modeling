@@ -1,0 +1,865 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from proj.project.coast_paths import COAST_CONFIGS, models_output_dir, resolve_windows_path, results_output_dir
+from proj.project.window_data import (
+    FEATURE_COLS,
+    build_window_arrays,
+    evaluate_final_position,
+    evaluate_full_trajectory,
+    haversine_km,
+    horizon_step_index,
+    infer_window_shape,
+    load_windows,
+    mask_by_split,
+    naive_position_at_horizon,
+    print_position_metrics,
+    scale_history_features,
+    trajectory_splits,
+    window_horizon_hours,
+)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class WindowDataset(Dataset):
+    """
+    Each sample is one trajectory window.
+
+    x:
+        Past AIS features.
+        Shape: (history_steps, num_features)
+
+    y_delta:
+        Future position deltas relative to the last known position.
+        Shape: (future_steps, 2)
+
+    anchor:
+        Last known absolute position [lat, lon].
+        Shape: (2,)
+    """
+
+    def __init__(self, x: np.ndarray, y_delta: np.ndarray, anchor: np.ndarray):
+        self.x = torch.tensor(x, dtype=torch.float32)
+        self.y_delta = torch.tensor(y_delta, dtype=torch.float32)
+        self.anchor = torch.tensor(anchor, dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, idx: int):
+        return self.x[idx], self.y_delta[idx], self.anchor[idx]
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class ShipTrajectoryRNN(nn.Module):
+    """
+    RNN/LSTM/GRU model for ship trajectory prediction.
+
+    This follows the course convention:
+    1. The recurrent layer receives a sequence.
+    2. We keep the last hidden representation: out[:, -1, :].
+    3. A small fully-connected head maps it to the final prediction.
+
+    Input shape:
+        x: (batch_size, history_steps, input_dim)
+
+    Output shape:
+        y_hat_delta: (batch_size, future_steps, 2)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        future_steps: int,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        rnn_type: str = "lstm",
+    ):
+        super().__init__()
+
+        self.future_steps = future_steps
+        self.rnn_type = rnn_type.lower()
+
+        rnn_dropout = dropout if num_layers > 1 else 0.0
+
+        if self.rnn_type == "rnn":
+            self.rnn = nn.RNN(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                nonlinearity="tanh",
+                batch_first=True,
+                dropout=rnn_dropout,
+            )
+        elif self.rnn_type == "gru":
+            self.rnn = nn.GRU(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=rnn_dropout,
+            )
+        elif self.rnn_type == "lstm":
+            self.rnn = nn.LSTM(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=rnn_dropout,
+            )
+        else:
+            raise ValueError("rnn_type must be one of: 'rnn', 'gru', 'lstm'")
+
+        self.regressor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, future_steps * 2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rnn_out, _ = self.rnn(x)
+
+        # Last-step pooling: use the representation after reading the full history.
+        last_state = rnn_out[:, -1, :]
+
+        y_hat_delta = self.regressor(last_state)
+        y_hat_delta = y_hat_delta.view(-1, self.future_steps, 2)
+
+        return y_hat_delta
+
+
+# ---------------------------------------------------------------------------
+# Train / Evaluate
+# ---------------------------------------------------------------------------
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> float:
+    model.train()
+
+    total_loss = 0.0
+    total_count = 0
+
+    for batch_x, batch_y_delta, _ in dataloader:
+        batch_x = batch_x.to(device)
+        batch_y_delta = batch_y_delta.to(device)
+
+        y_hat_delta = model(batch_x)
+        loss = criterion(y_hat_delta, batch_y_delta)
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        # Useful for recurrent models, because they can suffer from exploding gradients.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+
+        batch_size = batch_x.size(0)
+        total_loss += loss.item() * batch_size
+        total_count += batch_size
+
+    return total_loss / max(total_count, 1)
+
+
+@torch.no_grad()
+def evaluate_loss(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> float:
+    model.eval()
+
+    total_loss = 0.0
+    total_count = 0
+
+    for batch_x, batch_y_delta, _ in dataloader:
+        batch_x = batch_x.to(device)
+        batch_y_delta = batch_y_delta.to(device)
+
+        y_hat_delta = model(batch_x)
+        loss = criterion(y_hat_delta, batch_y_delta)
+
+        batch_size = batch_x.size(0)
+        total_loss += loss.item() * batch_size
+        total_count += batch_size
+
+    return total_loss / max(total_count, 1)
+
+
+@torch.no_grad()
+def predict_absolute_positions(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    The model predicts deltas relative to the last known point.
+    For evaluation we convert them back to absolute lat/lon.
+    """
+    model.eval()
+
+    y_true_list = []
+    y_pred_list = []
+
+    for batch_x, batch_y_delta, batch_anchor in dataloader:
+        batch_x = batch_x.to(device)
+
+        y_hat_delta = model(batch_x).cpu().numpy()
+        y_true_delta = batch_y_delta.numpy()
+        anchor = batch_anchor.numpy()[:, np.newaxis, :]
+
+        y_true_abs = anchor + y_true_delta
+        y_pred_abs = anchor + y_hat_delta
+
+        y_true_list.append(y_true_abs)
+        y_pred_list.append(y_pred_abs)
+
+    return np.concatenate(y_true_list, axis=0), np.concatenate(y_pred_list, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Metrics and plots
+# ---------------------------------------------------------------------------
+
+def save_training_plot(history: list[dict[str, float]], output_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    epochs = [row["epoch"] for row in history]
+    train_loss = [row["train_loss"] for row in history]
+    val_loss = [row["val_loss"] for row in history]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, train_loss, label="Train loss")
+    ax.plot(epochs, val_loss, label="Validation loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE loss")
+    ax.set_title("RNN Training History")
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def save_error_histogram(
+    y_true_final: np.ndarray,
+    y_pred_final: np.ndarray,
+    output_path: Path,
+    title: str,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    errors_km = haversine_km(
+        y_true_final[:, 0],
+        y_true_final[:, 1],
+        y_pred_final[:, 0],
+        y_pred_final[:, 1],
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(errors_km, bins=60)
+    ax.axvline(errors_km.mean(), linestyle="--", label=f"mean = {errors_km.mean():.3f} km")
+    ax.axvline(np.median(errors_km), linestyle="--", label=f"median = {np.median(errors_km):.3f} km")
+    ax.set_xlabel("Prediction error (kilometers)")
+    ax.set_ylabel("Count")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def save_scatter_plot(
+    y_true_final: np.ndarray,
+    y_pred_final: np.ndarray,
+    output_path: Path,
+    title: str,
+    max_points: int = 5000,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    if len(y_true_final) > max_points:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(y_true_final), size=max_points, replace=False)
+        y_true_final = y_true_final[idx]
+        y_pred_final = y_pred_final[idx]
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+    for ax, dim, name in zip(axes, [0, 1], ["Latitude", "Longitude"]):
+        ax.scatter(y_true_final[:, dim], y_pred_final[:, dim], s=6, alpha=0.25)
+
+        low = min(y_true_final[:, dim].min(), y_pred_final[:, dim].min())
+        high = max(y_true_final[:, dim].max(), y_pred_final[:, dim].max())
+
+        ax.plot([low, high], [low, high], linestyle="--", linewidth=1.5, label="perfect")
+        ax.set_xlabel(f"Actual {name}")
+        ax.set_ylabel(f"Predicted {name}")
+        ax.set_title(name)
+        ax.legend()
+        ax.grid(True, linestyle="--", alpha=0.35)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Main experiment
+# ---------------------------------------------------------------------------
+
+def run_rnn(
+    input_path: Path,
+    coast_name: str | None,
+    region: str,
+    rnn_type: str,
+    hidden_dim: int,
+    num_layers: int,
+    dropout: float,
+    batch_size: int,
+    epochs: int,
+    learning_rate: float,
+    patience: int,
+    test_fraction: float,
+    val_fraction: float,
+    seed: int,
+    sample_size: int | None,
+    horizon_hours: float,
+) -> Path:
+    start_time = time.perf_counter()
+
+    input_path, coast, region = resolve_windows_path(coast_name, region, input_path)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # -----------------------------------------------------------------------
+    # Load processed windows
+    # -----------------------------------------------------------------------
+
+    print(f"Loading windows from: {input_path}")
+    df = load_windows(input_path, sample_size=sample_size)
+
+    output_dir = results_output_dir(coast, input_path, "RNN", df)
+    model_dir = models_output_dir(coast, input_path, df)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    history_steps, future_steps = infer_window_shape(df)
+    window_hours = window_horizon_hours(df, future_steps)
+    horizon_step = horizon_step_index(df, horizon_hours, future_steps)
+    actual_horizon_hours = (
+        (horizon_step + 1) * int(df["resample_minutes"].iloc[0]) / 60
+        if "resample_minutes" in df.columns
+        else horizon_hours
+    )
+
+    x, y_abs, y_delta, anchor = build_window_arrays(
+        df,
+        history_steps=history_steps,
+        future_steps=future_steps,
+    )
+
+    if "traj_id" in df.columns:
+        num_trajectories = df["traj_id"].nunique()
+    else:
+        num_trajectories = df["mmsi"].nunique()
+
+    print(f"\n=== {coast.name} | {output_dir.parent.name} ===")
+    print(f"Samples: {len(df):,}")
+    print(f"Trajectories: {num_trajectories:,}")
+    print(
+        f"Window: history={history_steps} steps | "
+        f"future={future_steps} steps | "
+        f"window={window_hours:.1f} h | "
+        f"eval horizon={actual_horizon_hours:.1f} h (step {horizon_step + 1}/{future_steps})"
+    )
+    print(f"Features: {FEATURE_COLS}")
+
+    # -----------------------------------------------------------------------
+    # Split by trajectory
+    # -----------------------------------------------------------------------
+
+    train_ids, val_ids, test_ids = trajectory_splits(
+        df,
+        test_fraction=test_fraction,
+        val_fraction=val_fraction,
+        seed=seed,
+    )
+
+    train_mask = mask_by_split(df, train_ids)
+    val_mask = mask_by_split(df, val_ids)
+    test_mask = mask_by_split(df, test_ids)
+
+    x_train = x[train_mask]
+    x_val = x[val_mask]
+    x_test = x[test_mask]
+
+    y_delta_train = y_delta[train_mask]
+    y_delta_val = y_delta[val_mask]
+    y_delta_test = y_delta[test_mask]
+
+    anchor_train = anchor[train_mask]
+    anchor_val = anchor[val_mask]
+    anchor_test = anchor[test_mask]
+
+    y_test_abs = y_abs[test_mask]
+
+    # Keep raw (unscaled) x_test for the naive baseline, which reads physical
+    # feature values (lat, lon, dlat, dlon) and would produce nonsense on
+    # StandardScaler-normalized data.
+    x_test_raw = x_test.copy()
+
+    # Important: fit scaler only on train, then apply to val/test.
+    x_train, [x_val, x_test], scaler = scale_history_features(
+        x_train,
+        [x_val, x_test],
+    )
+
+    train_dataset = WindowDataset(x_train, y_delta_train, anchor_train)
+    val_dataset = WindowDataset(x_val, y_delta_val, anchor_val)
+    test_dataset = WindowDataset(x_test, y_delta_test, anchor_test)
+
+    if len(train_dataset) == 0:
+        raise ValueError("No training windows found. Run preprocessing first or lower split fractions.")
+
+    print(
+        f"Windows — train: {len(train_dataset):,} | "
+        f"val: {len(val_dataset):,} | "
+        f"test: {len(test_dataset):,}"
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    # -----------------------------------------------------------------------
+    # Model, loss, optimizer
+    # -----------------------------------------------------------------------
+
+    model = ShipTrajectoryRNN(
+        input_dim=len(FEATURE_COLS),
+        future_steps=future_steps,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+        rnn_type=rnn_type,
+    ).to(device)
+
+    criterion = nn.HuberLoss(delta=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", patience=3, factor=0.5
+    )
+
+    param_count = sum(p.numel() for p in model.parameters())
+
+    print("\nModel:")
+    print(model)
+    print(f"Trainable parameters: {param_count:,}")
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    print("\nTraining...")
+    print("-" * 70)
+
+    # -----------------------------------------------------------------------
+    # Training loop
+    # -----------------------------------------------------------------------
+
+    best_val_loss = float("inf")
+    best_state = None
+    stale_epochs = 0
+    history = []
+    total_train_time = 0.0
+
+    for epoch in range(epochs):
+        epoch_start = time.perf_counter()
+
+        train_loss = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+        )
+
+        val_loss = evaluate_loss(
+            model=model,
+            dataloader=val_loader,
+            criterion=criterion,
+            device=device,
+        )
+
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]["lr"]
+        epoch_elapsed = time.perf_counter() - epoch_start
+        total_train_time += epoch_elapsed
+
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "lr": current_lr,
+                "epoch_sec": float(epoch_elapsed),
+            }
+        )
+
+        print(
+            f"| epoch {epoch:3d} | "
+            f"time: {epoch_elapsed:6.2f}s | "
+            f"train loss {train_loss:10.6f} | "
+            f"valid loss {val_loss:10.6f} | "
+            f"lr {current_lr:.2e}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+
+        if stale_epochs >= patience:
+            print(f"Early stopping after epoch {epoch}.")
+            break
+
+    print("-" * 70)
+
+    peak_gpu_mb = (
+        torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        if device.type == "cuda"
+        else 0.0
+    )
+    avg_throughput = len(train_dataset) * len(history) / max(total_train_time, 1e-6)
+    print(f"Peak GPU memory: {peak_gpu_mb:.1f} MB")
+    print(f"Avg throughput:  {avg_throughput:.1f} samples/sec")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # -----------------------------------------------------------------------
+    # Test evaluation
+    # -----------------------------------------------------------------------
+
+    y_true_traj, y_pred_traj = predict_absolute_positions(
+        model=model,
+        dataloader=test_loader,
+        device=device,
+    )
+
+    # Save sample trajectories for map visualisation in the comparison script.
+    n_map = min(200, len(y_true_traj))
+    rng_map = np.random.default_rng(seed)
+    map_idx = rng_map.choice(len(y_true_traj), size=n_map, replace=False)
+    traj_path = output_dir / f"{rnn_type}_sample_trajectories.json"
+    with traj_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "y_true": y_true_traj[map_idx].tolist(),
+                "y_pred": y_pred_traj[map_idx].tolist(),
+                "anchor": anchor_test[map_idx].tolist(),
+            },
+            f,
+        )
+
+    eval_true = y_true_traj[:, horizon_step, :]
+    eval_pred = y_pred_traj[:, horizon_step, :]
+
+    baseline_true, baseline_pred = naive_position_at_horizon(
+        x_test_raw,
+        y_test_abs,
+        horizon_step,
+    )
+
+    model_name = f"{rnn_type.upper()} trajectory model"
+
+    metrics = [
+        evaluate_final_position(
+            baseline_true,
+            baseline_pred,
+            "Naive baseline: constant last-step delta",
+        ),
+        evaluate_final_position(
+            eval_true,
+            eval_pred,
+            f"{model_name}: position ({actual_horizon_hours:.1f} h ahead)",
+        ),
+        evaluate_full_trajectory(
+            y_true_traj,
+            y_pred_traj,
+            f"{model_name}: full predicted trajectory",
+        ),
+    ]
+
+    for item in metrics:
+        print_position_metrics(item)
+
+    # -----------------------------------------------------------------------
+    # Save results
+    # -----------------------------------------------------------------------
+
+    model_path = model_dir / f"ship_trajectory_{rnn_type}.pt"
+    metrics_path = output_dir / f"{rnn_type}_metrics.json"
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "scaler_mean": scaler.mean_.astype(np.float32),
+            "scaler_scale": scaler.scale_.astype(np.float32),
+            "feature_cols": FEATURE_COLS,
+            "history_steps": history_steps,
+            "future_steps": future_steps,
+            "window_hours": window_hours,
+            "horizon_hours_requested": horizon_hours,
+            "horizon_hours_actual": actual_horizon_hours,
+            "horizon_step_index": horizon_step,
+            "rnn_type": rnn_type,
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "dropout": dropout,
+        },
+        model_path,
+    )
+
+    results = {
+        "input": str(input_path),
+        "coast": coast.name,
+        "days_label": output_dir.parent.name,
+        "region": region,
+        "samples_total": int(len(df)),
+        "samples_train": int(train_mask.sum()),
+        "samples_val": int(val_mask.sum()),
+        "samples_test": int(test_mask.sum()),
+        "features": FEATURE_COLS,
+        "history_steps": int(history_steps),
+        "future_steps": int(future_steps),
+        "window_hours": float(window_hours),
+        "horizon_hours_requested": float(horizon_hours),
+        "horizon_hours_actual": float(actual_horizon_hours),
+        "horizon_step_index": int(horizon_step),
+        "architecture": {
+            "type": rnn_type,
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "dropout": dropout,
+        },
+        "training": {
+            "batch_size": batch_size,
+            "epochs_ran": len(history),
+            "learning_rate": learning_rate,
+            "patience": patience,
+            "best_val_loss": float(best_val_loss),
+            "device": str(device),
+        },
+        "splits": {
+            "test_fraction": test_fraction,
+            "val_fraction": val_fraction,
+            "seed": seed,
+            "split_by": "trajectory",
+        },
+        "compute": {
+            "param_count": int(param_count),
+            "peak_gpu_mb": float(peak_gpu_mb),
+            "avg_throughput_samples_per_sec": float(avg_throughput),
+            "total_train_sec": float(total_train_time),
+        },
+        "metrics": metrics,
+        "history": history,
+        "runtime_sec": round(time.perf_counter() - start_time, 2),
+    }
+
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    save_training_plot(
+        history,
+        output_dir / f"{rnn_type}_training_history.png",
+    )
+
+    save_error_histogram(
+        eval_true,
+        eval_pred,
+        output_dir / f"{rnn_type}_error_hist.png",
+        f"{model_name} — Position Error ({actual_horizon_hours:.1f} h ahead)",
+    )
+
+    save_scatter_plot(
+        eval_true,
+        eval_pred,
+        output_dir / f"{rnn_type}_scatter.png",
+        f"{model_name} — Position ({actual_horizon_hours:.1f} h ahead)",
+    )
+
+    print("\nSaved files:")
+    print(f"  model:   {model_path}")
+    print(f"  metrics: {metrics_path}")
+    print(f"  trajs:   {traj_path}")
+    print(f"  plots:   {output_dir / f'{rnn_type}_training_history.png'}")
+    print(f"           {output_dir / f'{rnn_type}_error_hist.png'}")
+    print(f"           {output_dir / f'{rnn_type}_scatter.png'}")
+    print(f"Runtime: {format_duration(time.perf_counter() - start_time)}")
+
+    return metrics_path
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train an RNN/LSTM/GRU model for ship trajectory prediction."
+    )
+
+    parser.add_argument(
+        "--coast",
+        choices=sorted(COAST_CONFIGS.keys()),
+        default=None,
+        help="Coastal area (default: Eastern coast, or inferred from --input).",
+    )
+
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=None,
+        help="Path to model_ready_windows.parquet.",
+    )
+
+    parser.add_argument(
+        "--region",
+        type=str,
+        default=None,
+        help="Region label used by the preprocessing script, if --input is not given.",
+    )
+
+    parser.add_argument(
+        "--rnn-type",
+        type=str,
+        default="lstm",
+        choices=["rnn", "gru", "lstm"],
+        help="Recurrent architecture to use.",
+    )
+
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=0,
+        help="Use a random sample for faster runs. 0 means use all windows.",
+    )
+
+    parser.add_argument(
+        "--horizon-hours",
+        type=float,
+        default=1.0,
+        help="How far ahead to evaluate (must fit inside the future window in the parquet).",
+    )
+
+    args = parser.parse_args()
+
+    if args.region is None:
+        if args.coast is not None:
+            region = COAST_CONFIGS[args.coast].default_region
+        else:
+            region = COAST_CONFIGS["Eastern coast"].default_region
+    else:
+        region = args.region
+
+    run_rnn(
+        input_path=args.input,
+        coast_name=args.coast,
+        region=region,
+        rnn_type=args.rnn_type,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        learning_rate=args.lr,
+        patience=args.patience,
+        test_fraction=args.test_fraction,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
+        sample_size=None if args.sample <= 0 else args.sample,
+        horizon_hours=args.horizon_hours,
+    )
+
+
+if __name__ == "__main__":
+    main()
