@@ -7,24 +7,80 @@ import json
 from pathlib import Path
 
 
-def pick_metrics(metrics: list[dict]) -> dict:
-    out: dict = {}
+def _metric_row(metrics: list[dict], predicate) -> dict | None:
     for row in metrics:
-        name = row.get("model", "")
-        if "Naive baseline" in name:
-            out["naive_12h"] = {k: v for k, v in row.items() if k != "model"}
-        elif (
-            "full predicted" not in name
-            and "[straight" not in name
-            and "[maneuver" not in name
-            and "[anchored" not in name
-            and "[other" not in name
-            and "position (" in name
-        ):
-            out["model_12h"] = {k: v for k, v in row.items() if k != "model"}
-        elif "[straight" in name:
-            out["straight_12h"] = {k: v for k, v in row.items() if k != "model"}
+        if predicate(row.get("model", "")):
+            return {k: v for k, v in row.items() if k != "model"}
+    return None
+
+
+def pick_metrics(metrics: list[dict]) -> dict:
+    """Extract absolute + normalized FDE/ADE and stratified buckets."""
+    out: dict = {}
+
+    naive = _metric_row(metrics, lambda n: "Naive baseline" in n)
+    if naive:
+        out["naive_12h"] = naive
+
+    kinematic = _metric_row(metrics, lambda n: "Kinematic baseline" in n)
+    if kinematic:
+        out["kinematic_12h"] = kinematic
+
+    model_12h = _metric_row(
+        metrics,
+        lambda n: (
+            "full predicted" not in n
+            and "[" not in n
+            and "position (" in n
+            and "baseline" not in n.lower()
+        ),
+    )
+    if model_12h:
+        out["model_12h"] = model_12h
+
+    full_traj = _metric_row(metrics, lambda n: "full predicted trajectory" in n)
+    if full_traj:
+        out["model_full_traj"] = full_traj
+
+    for bucket in ("straight", "maneuver", "anchored", "other"):
+        row = _metric_row(metrics, lambda n, b=bucket: f"[{b}," in n)
+        if row:
+            out[f"{bucket}_12h"] = row
+
     return out
+
+
+def build_summary(test_metrics: dict) -> dict:
+    """Compact comparison keys for tables (km + normalized ratios)."""
+    summary: dict = {}
+
+    def _fde(row: dict | None, prefix: str) -> None:
+        if not row:
+            return
+        summary[f"{prefix}_fde_km_mean"] = row.get("mean_error_km")
+        summary[f"{prefix}_fde_km_median"] = row.get("median_error_km")
+        if "mean_nfde" in row:
+            summary[f"{prefix}_nfde_mean"] = row["mean_nfde"]
+            summary[f"{prefix}_nfde_median"] = row.get("median_nfde")
+
+    def _ade(row: dict | None, prefix: str) -> None:
+        if not row:
+            return
+        summary[f"{prefix}_ade_km_mean"] = row.get("mean_ade_km")
+        summary[f"{prefix}_ade_km_median"] = row.get("median_ade_km")
+        if "mean_nade" in row:
+            summary[f"{prefix}_nade_mean"] = row["mean_nade"]
+            summary[f"{prefix}_nade_median"] = row.get("median_nade")
+
+    _fde(test_metrics.get("naive_12h"), "naive")
+    _fde(test_metrics.get("kinematic_12h"), "kinematic")
+    _fde(test_metrics.get("model_12h"), "model")
+    _ade(test_metrics.get("model_full_traj"), "model")
+
+    for bucket in ("straight", "maneuver", "anchored", "other"):
+        _fde(test_metrics.get(f"{bucket}_12h"), bucket)
+
+    return summary
 
 
 def load_model_entry(path: Path) -> dict:
@@ -35,6 +91,7 @@ def load_model_entry(path: Path) -> dict:
         (h["epoch"] for h in hist if abs(h["val_loss"] - best_val) < 1e-9),
         None,
     )
+    test_metrics = pick_metrics(data.get("metrics", []))
     return {
         "metrics_path": str(path),
         "architecture": data.get("architecture", {}),
@@ -47,7 +104,9 @@ def load_model_entry(path: Path) -> dict:
             "val": data["samples_val"],
             "test": data["samples_test"],
         },
-        "test_metrics": pick_metrics(data.get("metrics", [])),
+        "split_by": data.get("split_by"),
+        "test_metrics": test_metrics,
+        "summary": build_summary(test_metrics),
     }
 
 

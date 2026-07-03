@@ -43,11 +43,13 @@ def _region_from_folder(folder: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _is_canonical(wf: Path, include_misplaced: bool) -> tuple[bool, str]:
+def _is_canonical(wf: Path, include_misplaced: bool, tag: str | None = None) -> tuple[bool, str]:
     coast_dir = wf.parent.parent.name
     region = _region_from_folder(wf.parent.name)
     if region is None:
         return False, f"can't infer region from '{wf.parent.name}'"
+    if tag and f"_{tag}_" not in wf.parent.name:
+        return False, f"tag filter '{tag}'"
     if "_1d_" in wf.parent.name:
         return False, "1d dataset (too short for 24h+12h windows)"
     expected = COAST_DIR_TO_REGION_PREFIX.get(coast_dir)
@@ -71,6 +73,7 @@ def combine(
     test_frac: float,
     no_split: bool,
     seed: int,
+    tag: str | None = None,
 ) -> None:
     t0 = time.perf_counter()
 
@@ -83,11 +86,11 @@ def combine(
 
     included: list[tuple[Path, str]] = []   # (path, region)
     for wf in window_files:
-        ok, reason = _is_canonical(wf, include_misplaced)
-        tag = "READ" if ok else "SKIP"
+        ok, reason = _is_canonical(wf, include_misplaced, tag=tag)
+        action = "READ" if ok else "SKIP"
         region = _region_from_folder(wf.parent.name) or "?"
         label = f"{wf.parent.parent.name}/{wf.parent.name}"
-        print(f"  {tag}  {label}  — {reason}")
+        print(f"  {action}  {label}  — {reason}")
         if ok:
             included.append((wf, region))
 
@@ -217,6 +220,11 @@ def main() -> None:
     parser.add_argument("--out", default="data/processed/combined")
     parser.add_argument("--include-misplaced", action="store_true",
                         help="Include datasets in wrong coast folder (e.g. West Coast/ais_east_coast_14d).")
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help="Only combine datasets whose folder name contains this tag (e.g. feb, 14d).",
+    )
     parser.add_argument("--no-split", action="store_true",
                         help="Save one all_windows.parquet instead of train/val/test.")
     parser.add_argument("--val-frac",  type=float, default=0.10)
@@ -232,6 +240,7 @@ def main() -> None:
         test_frac=args.test_frac,
         no_split=args.no_split,
         seed=args.seed,
+        tag=args.tag,
     )
 
 

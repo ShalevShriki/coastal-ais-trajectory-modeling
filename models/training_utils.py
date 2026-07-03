@@ -52,15 +52,20 @@ class TrajectoryLoss(nn.Module):
     Combined Huber (delta in degrees) + Haversine (km) on absolute positions.
 
     Supports curriculum via set_train_steps() and per-sample difficulty weights.
+    Optional relative term: ADE / true path length (clamped) for scale-invariant training.
     """
 
     def __init__(
         self,
         haversine_weight: float = 0.5,
         huber_delta: float = 0.01,
+        relative_weight: float = 0.0,
+        min_path_km: float = 10.0,
     ):
         super().__init__()
         self.haversine_weight = float(haversine_weight)
+        self.relative_weight = float(relative_weight)
+        self.min_path_km = float(min_path_km)
         self.huber = nn.HuberLoss(delta=huber_delta, reduction="none")
         self.train_steps: int | None = None
 
@@ -92,6 +97,17 @@ class TrajectoryLoss(nn.Module):
         w = self.haversine_weight
         loss = (1.0 - w) * huber + w * haversine
 
+        if self.relative_weight > 0.0 and steps > 1:
+            step_dist = local_km_error_torch(
+                true_abs[:, 1:, 0],
+                true_abs[:, 1:, 1],
+                true_abs[:, :-1, 0],
+                true_abs[:, :-1, 1],
+            )
+            path_len = step_dist.sum(dim=1).clamp_min(self.min_path_km)
+            relative_ade = dist_km.mean(dim=1) / path_len
+            loss = loss + self.relative_weight * relative_ade
+
         if sample_weight is not None:
             loss = loss * sample_weight
 
@@ -101,6 +117,8 @@ class TrajectoryLoss(nn.Module):
 @dataclass
 class TrainingImprovementConfig:
     haversine_weight: float = 0.5
+    relative_loss_weight: float = 0.0
+    min_path_km: float = 10.0
     difficulty_weighting: bool = True
     maneuver_oversample: bool = True
     maneuver_fraction: float = 0.3
@@ -108,6 +126,8 @@ class TrainingImprovementConfig:
     straight_fraction: float = 0.15
     other_fraction: float = 0.15
     residual_naive: bool = False
+    kinematic_baseline: bool = True
+    split_by: str = "trajectory"
     curriculum: bool = True
     curriculum_start_hours: float = 6.0
     scheduled_teacher_forcing: bool = True
@@ -161,6 +181,8 @@ def unpack_window_batch(
 def training_improvements_dict(config: TrainingImprovementConfig) -> dict:
     return {
         "haversine_weight": config.haversine_weight,
+        "relative_loss_weight": config.relative_loss_weight,
+        "min_path_km": config.min_path_km,
         "difficulty_weighting": config.difficulty_weighting,
         "maneuver_oversample": config.maneuver_oversample,
         "maneuver_fraction": config.maneuver_fraction,
@@ -168,6 +190,8 @@ def training_improvements_dict(config: TrainingImprovementConfig) -> dict:
         "straight_fraction": config.straight_fraction,
         "other_fraction": config.other_fraction,
         "residual_naive": config.residual_naive,
+        "kinematic_baseline": config.kinematic_baseline,
+        "split_by": config.split_by,
         "curriculum": config.curriculum,
         "curriculum_start_hours": config.curriculum_start_hours,
         "scheduled_teacher_forcing": config.scheduled_teacher_forcing,
@@ -215,6 +239,18 @@ def add_training_improvement_args(parser) -> None:
         help="Weight for Haversine km term in combined loss (0=Huber only, 1=Haversine only).",
     )
     parser.add_argument(
+        "--relative-loss-weight",
+        type=float,
+        default=0.0,
+        help="Optional ADE/path-length relative term in training loss (0=off, try 0.1–0.2).",
+    )
+    parser.add_argument(
+        "--min-path-km",
+        type=float,
+        default=10.0,
+        help="Floor for path-length normalization in relative loss/metrics (default 10 km).",
+    )
+    parser.add_argument(
         "--no-difficulty-weighting",
         action="store_true",
         help="Disable per-sample loss weights from |dcog|/|dsog| in history.",
@@ -247,6 +283,17 @@ def add_training_improvement_args(parser) -> None:
         help="Predict correction to constant-velocity naive trajectory.",
     )
     parser.add_argument(
+        "--no-kinematic-baseline",
+        action="store_true",
+        help="Use last-step dlat/dlon baseline instead of SOG+COG for residuals/metrics.",
+    )
+    parser.add_argument(
+        "--split-by",
+        choices=("trajectory", "mmsi"),
+        default="trajectory",
+        help="Group column for train/val/test split (mmsi = stronger generalization test).",
+    )
+    parser.add_argument(
         "--maneuver-fraction",
         type=float,
         default=0.3,
@@ -273,6 +320,8 @@ def add_training_improvement_args(parser) -> None:
 def training_config_from_args(args) -> TrainingImprovementConfig:
     return TrainingImprovementConfig(
         haversine_weight=getattr(args, "haversine_loss_weight", 0.5),
+        relative_loss_weight=getattr(args, "relative_loss_weight", 0.0),
+        min_path_km=getattr(args, "min_path_km", 10.0),
         difficulty_weighting=not getattr(args, "no_difficulty_weighting", False),
         maneuver_oversample=not getattr(args, "no_maneuver_oversample", False),
         maneuver_fraction=getattr(args, "maneuver_fraction", 0.3),
@@ -280,6 +329,8 @@ def training_config_from_args(args) -> TrainingImprovementConfig:
         straight_fraction=getattr(args, "straight_fraction", 0.15),
         other_fraction=getattr(args, "other_fraction", 0.15),
         residual_naive=getattr(args, "residual_naive", False),
+        kinematic_baseline=not getattr(args, "no_kinematic_baseline", False),
+        split_by=getattr(args, "split_by", "trajectory"),
         curriculum=not getattr(args, "no_curriculum", False),
         curriculum_start_hours=getattr(args, "curriculum_start_hours", 6.0),
         scheduled_teacher_forcing=not getattr(args, "no_scheduled_tf", False),

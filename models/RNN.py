@@ -18,8 +18,8 @@ from torch.utils.data import Dataset, DataLoader
 from proj.project.coast_paths import COAST_CONFIGS, models_output_dir, resolve_windows_path, results_output_dir
 from proj.project.window_data import (
     FEATURE_COLS,
+    baseline_cumulative_delta,
     build_window_arrays,
-    compute_naive_cumulative_delta,
     compute_sample_weights,
     evaluate_final_position,
     evaluate_full_trajectory,
@@ -27,14 +27,14 @@ from proj.project.window_data import (
     haversine_km,
     horizon_step_index,
     infer_window_shape,
+    kinematic_position_at_horizon,
     load_windows_filtered,
     add_stationary_filter_args,
     stationary_filter_from_args,
-    mask_by_split,
+    make_train_val_test_frames,
     naive_position_at_horizon,
     print_position_metrics,
     scale_history_features,
-    trajectory_splits,
     window_horizon_hours,
 )
 from proj.project.models.training_utils import (
@@ -447,16 +447,18 @@ def run_rnn(
     # Load processed windows
     # -----------------------------------------------------------------------
 
+    # Uniform row cap before split (memory); balancing/subsampling happens on train only.
+    prefetch_size = None
+    if sample_size is not None:
+        prefetch_size = int(sample_size / 0.7) + 1000
+
     print(f"Loading windows from: {input_path}")
     df = load_windows_filtered(
         input_path,
-        sample_size=sample_size,
+        sample_size=prefetch_size,
         motion_filter=motion_filter,
-        maneuver_oversample=training_config.maneuver_oversample,
-        maneuver_fraction=training_config.maneuver_fraction,
-        motion_balanced_sample=training_config.motion_balanced_sample,
-        straight_fraction=training_config.straight_fraction,
-        other_fraction=training_config.other_fraction,
+        maneuver_oversample=False,
+        motion_balanced_sample=False,
         seed=seed,
     )
 
@@ -468,28 +470,65 @@ def run_rnn(
     history_steps, future_steps = infer_window_shape(df)
     window_hours = window_horizon_hours(df, future_steps)
     horizon_step = horizon_step_index(df, horizon_hours, future_steps)
+    step_minutes = (
+        float(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10.0
+    )
     actual_horizon_hours = (
-        (horizon_step + 1) * int(df["resample_minutes"].iloc[0]) / 60
+        (horizon_step + 1) * step_minutes / 60
         if "resample_minutes" in df.columns
         else horizon_hours
     )
 
-    x, y_abs, y_delta, anchor = build_window_arrays(
+    train_df, val_df, test_df, split_col = make_train_val_test_frames(
         df,
-        history_steps=history_steps,
-        future_steps=future_steps,
+        test_fraction=test_fraction,
+        val_fraction=val_fraction,
+        seed=seed,
+        split_by=training_config.split_by,
+        train_sample_size=sample_size,
+        maneuver_oversample=training_config.maneuver_oversample,
+        maneuver_fraction=training_config.maneuver_fraction,
+        motion_balanced_sample=training_config.motion_balanced_sample,
+        straight_fraction=training_config.straight_fraction,
+        other_fraction=training_config.other_fraction,
     )
-    naive_delta = compute_naive_cumulative_delta(x, future_steps)
-    naive_for_dataset = naive_delta if training_config.residual_naive else None
 
-    if "traj_id" in df.columns:
-        num_trajectories = df["traj_id"].nunique()
+    x_train, y_abs_train, y_delta_train, anchor_train = build_window_arrays(
+        train_df, history_steps=history_steps, future_steps=future_steps
+    )
+    x_val, _, y_delta_val, anchor_val = build_window_arrays(
+        val_df, history_steps=history_steps, future_steps=future_steps
+    )
+    x_test, y_test_abs, y_delta_test, anchor_test = build_window_arrays(
+        test_df, history_steps=history_steps, future_steps=future_steps
+    )
+
+    use_kinematic = training_config.kinematic_baseline
+    naive_for_dataset = training_config.residual_naive
+
+    def _baseline_delta(x_arr: np.ndarray) -> np.ndarray:
+        return baseline_cumulative_delta(
+            x_arr,
+            future_steps,
+            kinematic=use_kinematic,
+            step_minutes=step_minutes,
+        )
+
+    naive_train = _baseline_delta(x_train) if naive_for_dataset else None
+    naive_val = _baseline_delta(x_val) if naive_for_dataset else None
+    naive_test = _baseline_delta(x_test) if naive_for_dataset else None
+
+    split_label = "trajectories" if split_col == "traj_id" else "MMSIs"
+    if split_col in df.columns:
+        num_entities = df[split_col].nunique()
+    elif "traj_id" in df.columns:
+        num_entities = df["traj_id"].nunique()
     else:
-        num_trajectories = df["mmsi"].nunique()
+        num_entities = df["mmsi"].nunique()
 
     print(f"\n=== {coast.name} | {output_dir.parent.name} ===")
-    print(f"Samples: {len(df):,}")
-    print(f"Trajectories: {num_trajectories:,}")
+    print(f"Samples loaded: {len(df):,}")
+    print(f"Unique {split_label}: {num_entities:,} (split by {training_config.split_by})")
     print(
         f"Window: history={history_steps} steps | "
         f"future={future_steps} steps | "
@@ -498,46 +537,11 @@ def run_rnn(
     )
     print(f"Features: {FEATURE_COLS}")
 
-    # -----------------------------------------------------------------------
-    # Split by trajectory
-    # -----------------------------------------------------------------------
-
-    train_ids, val_ids, test_ids = trajectory_splits(
-        df,
-        test_fraction=test_fraction,
-        val_fraction=val_fraction,
-        seed=seed,
-    )
-
-    train_mask = mask_by_split(df, train_ids)
-    val_mask = mask_by_split(df, val_ids)
-    test_mask = mask_by_split(df, test_ids)
-
-    x_train = x[train_mask]
-    x_val = x[val_mask]
-    x_test = x[test_mask]
-
-    y_delta_train = y_delta[train_mask]
-    y_delta_val = y_delta[val_mask]
-    y_delta_test = y_delta[test_mask]
-
-    naive_train = naive_delta[train_mask] if naive_for_dataset is not None else None
-    naive_val = naive_delta[val_mask] if naive_for_dataset is not None else None
-    naive_test = naive_delta[test_mask] if naive_for_dataset is not None else None
-
-    anchor_train = anchor[train_mask]
-    anchor_val = anchor[val_mask]
-    anchor_test = anchor[test_mask]
-
-    y_test_abs = y_abs[test_mask]
-
-    # Keep raw (unscaled) x_test for the naive baseline, which reads physical
-    # feature values (lat, lon, dlat, dlon) and would produce nonsense on
-    # StandardScaler-normalized data.
+    # Keep raw (unscaled) x_test for baselines, which read physical feature values.
     x_test_raw = x_test.copy()
 
     train_weights = (
-        compute_sample_weights(x[train_mask])
+        compute_sample_weights(x_train)
         if training_config.difficulty_weighting
         else None
     )
@@ -597,7 +601,11 @@ def run_rnn(
         rnn_type=rnn_type,
     ).to(device)
 
-    criterion = TrajectoryLoss(haversine_weight=training_config.haversine_weight)
+    criterion = TrajectoryLoss(
+        haversine_weight=training_config.haversine_weight,
+        relative_weight=training_config.relative_loss_weight,
+        min_path_km=training_config.min_path_km,
+    )
     resample_minutes = (
         int(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10
     )
@@ -762,6 +770,12 @@ def run_rnn(
         y_test_abs,
         horizon_step,
     )
+    kin_true, kin_pred = kinematic_position_at_horizon(
+        x_test_raw,
+        y_test_abs,
+        horizon_step,
+        step_minutes=step_minutes,
+    )
 
     model_name = f"{rnn_type.upper()} trajectory model"
 
@@ -770,11 +784,19 @@ def run_rnn(
             baseline_true,
             baseline_pred,
             "Naive baseline: constant last-step delta",
+            anchor=anchor_test,
+        ),
+        evaluate_final_position(
+            kin_true,
+            kin_pred,
+            "Kinematic baseline: constant SOG+COG",
+            anchor=anchor_test,
         ),
         evaluate_final_position(
             eval_true,
             eval_pred,
             f"{model_name}: position ({actual_horizon_hours:.1f} h ahead)",
+            anchor=anchor_test,
         ),
         evaluate_full_trajectory(
             y_true_traj,
@@ -788,6 +810,7 @@ def run_rnn(
             eval_pred,
             x_test_raw,
             f"{model_name}: position ({actual_horizon_hours:.1f} h ahead)",
+            anchor=anchor_test,
         )
     )
 
@@ -827,9 +850,10 @@ def run_rnn(
         "days_label": output_dir.parent.name,
         "region": region,
         "samples_total": int(len(df)),
-        "samples_train": int(train_mask.sum()),
-        "samples_val": int(val_mask.sum()),
-        "samples_test": int(test_mask.sum()),
+        "samples_train": int(len(train_df)),
+        "samples_val": int(len(val_df)),
+        "samples_test": int(len(test_df)),
+        "split_by": training_config.split_by,
         "features": FEATURE_COLS,
         "history_steps": int(history_steps),
         "future_steps": int(future_steps),

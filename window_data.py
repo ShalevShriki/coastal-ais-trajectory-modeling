@@ -152,12 +152,19 @@ class StationaryFilterConfig:
     """Drop windows where the vessel barely leaves a small geographic cell."""
 
     enabled: bool = True
-    # Max distance from anchor to any history/future point (the "cell" radius).
+    # Use only history features for filtering (no future lat/lon/SOG leakage).
+    history_only: bool = True
+    # Max distance from anchor to any history point (the "cell" radius).
     max_confined_radius_km: float = 0.5
-    # Net displacement anchor → final future position.
-    min_future_displacement_km: float = 1.0
+    # Net displacement over history (history_only) or future (legacy mode).
+    min_displacement_km: float = 1.0
     # Optional: mean SOG below this (knots) reinforces stationary classification.
     min_mean_sog_kn: float = 0.5
+
+    @property
+    def min_future_displacement_km(self) -> float:
+        """Backward-compatible alias used by older scripts."""
+        return self.min_displacement_km
 
 
 def _track_path_length_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
@@ -165,6 +172,47 @@ def _track_path_length_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
         return np.zeros(lat.shape[0], dtype=np.float64)
     seg = haversine_km(lat[:, :-1], lon[:, :-1], lat[:, 1:], lon[:, 1:])
     return seg.sum(axis=1)
+
+
+def compute_history_motion_metrics(
+    df: pd.DataFrame,
+    history_steps: int | None = None,
+) -> pd.DataFrame:
+    """Motion stats from the history window only (safe for training filters)."""
+    if history_steps is None:
+        history_steps, _ = infer_window_shape(df)
+
+    lat_hist = df[[f"x_t{t:03d}_lat" for t in range(history_steps)]].to_numpy(dtype=np.float64)
+    lon_hist = df[[f"x_t{t:03d}_lon" for t in range(history_steps)]].to_numpy(dtype=np.float64)
+    anchor_lat = lat_hist[:, -1]
+    anchor_lon = lon_hist[:, -1]
+
+    dist_from_anchor = haversine_km(
+        anchor_lat[:, np.newaxis],
+        anchor_lon[:, np.newaxis],
+        lat_hist,
+        lon_hist,
+    )
+    history_max_radius_km = dist_from_anchor.max(axis=1)
+    history_displacement_km = haversine_km(
+        lat_hist[:, 0], lon_hist[:, 0], anchor_lat, anchor_lon
+    )
+    history_path_length_km = _track_path_length_km(lat_hist, lon_hist)
+
+    sog_cols = [f"x_t{t:03d}_sog" for t in range(history_steps)]
+    if all(c in df.columns for c in sog_cols):
+        history_mean_sog_kn = df[sog_cols].to_numpy(dtype=np.float64).mean(axis=1)
+    else:
+        history_mean_sog_kn = np.full(len(df), np.nan, dtype=np.float64)
+
+    return pd.DataFrame(
+        {
+            "history_max_radius_km": history_max_radius_km,
+            "history_displacement_km": history_displacement_km,
+            "history_path_length_km": history_path_length_km,
+            "history_mean_sog_kn": history_mean_sog_kn,
+        }
+    )
 
 
 def compute_window_motion_metrics(
@@ -230,16 +278,24 @@ def stationary_window_mask(
     """
     True = boring / confined window (candidate for removal).
 
-    Primary rule: stays inside a small cell AND barely moves net over 12h future.
-    Secondary: very low SOG + low future displacement.
+    When config.history_only is True (default), uses only history motion stats.
     """
-    confined = metrics["max_radius_km"] <= config.max_confined_radius_km
-    short_future = metrics["future_displacement_km"] < config.min_future_displacement_km
-    primary = confined & short_future
+    if config.history_only:
+        radius_col = "history_max_radius_km"
+        disp_col = "history_displacement_km"
+        sog_col = "history_mean_sog_kn"
+    else:
+        radius_col = "max_radius_km"
+        disp_col = "future_displacement_km"
+        sog_col = "mean_sog_kn"
 
-    if np.isfinite(metrics["mean_sog_kn"]).any():
-        slow = metrics["mean_sog_kn"] < config.min_mean_sog_kn
-        secondary = slow & short_future & confined
+    confined = metrics[radius_col] <= config.max_confined_radius_km
+    short_motion = metrics[disp_col] < config.min_displacement_km
+    primary = confined & short_motion
+
+    if sog_col in metrics.columns and np.isfinite(metrics[sog_col]).any():
+        slow = metrics[sog_col] < config.min_mean_sog_kn
+        secondary = slow & short_motion & confined
         return (primary | secondary).to_numpy()
     return primary.to_numpy()
 
@@ -251,21 +307,27 @@ def filter_stationary_windows(
     if not config.enabled or df.empty:
         return df, {"removed": 0.0, "kept_fraction": 1.0}
 
-    metrics = compute_window_motion_metrics(df)
+    metrics = (
+        compute_history_motion_metrics(df)
+        if config.history_only
+        else compute_window_motion_metrics(df)
+    )
     remove = stationary_window_mask(metrics, config)
     n_removed = int(remove.sum())
     n_total = len(df)
 
+    radius_col = "history_max_radius_km" if config.history_only else "max_radius_km"
     stats = {
         "windows_total": float(n_total),
         "windows_removed": float(n_removed),
         "windows_kept": float(n_total - n_removed),
         "removed_fraction": float(n_removed / max(n_total, 1)),
         "kept_fraction": float((n_total - n_removed) / max(n_total, 1)),
-        "median_max_radius_km_removed": float(metrics.loc[remove, "max_radius_km"].median())
+        "history_only": float(config.history_only),
+        "median_max_radius_km_removed": float(metrics.loc[remove, radius_col].median())
         if n_removed
         else 0.0,
-        "median_max_radius_km_kept": float(metrics.loc[~remove, "max_radius_km"].median())
+        "median_max_radius_km_kept": float(metrics.loc[~remove, radius_col].median())
         if n_removed < n_total
         else 0.0,
     }
@@ -277,9 +339,10 @@ def filter_stationary_windows(
 
 
 def print_stationary_filter_stats(stats: dict[str, float], config: StationaryFilterConfig) -> None:
+    scope = "history-only" if config.history_only else "history+future"
     print(
-        f"Stationary filter: radius≤{config.max_confined_radius_km:.2f} km & "
-        f"future disp<{config.min_future_displacement_km:.2f} km "
+        f"Stationary filter ({scope}): radius≤{config.max_confined_radius_km:.2f} km & "
+        f"disp<{config.min_displacement_km:.2f} km "
         f"(SOG<{config.min_mean_sog_kn:.1f} kn reinforces)"
     )
     print(
@@ -305,7 +368,12 @@ def add_stationary_filter_args(parser) -> None:
         "--min-future-displacement-km",
         type=float,
         default=1.0,
-        help="Min net future displacement to keep a confined window (default: 1.0 km).",
+        help="Min net displacement to keep a confined window (default: 1.0 km).",
+    )
+    parser.add_argument(
+        "--filter-use-future",
+        action="store_true",
+        help="Legacy: allow future trajectory in stationary filter (not recommended).",
     )
     parser.add_argument(
         "--min-mean-sog-kn",
@@ -318,8 +386,13 @@ def add_stationary_filter_args(parser) -> None:
 def stationary_filter_from_args(args) -> StationaryFilterConfig:
     return StationaryFilterConfig(
         enabled=getattr(args, "filter_stationary", False),
+        history_only=not getattr(args, "filter_use_future", False),
         max_confined_radius_km=getattr(args, "max_confined_radius_km", 0.5),
-        min_future_displacement_km=getattr(args, "min_future_displacement_km", 1.0),
+        min_displacement_km=getattr(
+            args,
+            "min_future_displacement_km",
+            getattr(args, "min_displacement_km", 1.0),
+        ),
         min_mean_sog_kn=getattr(args, "min_mean_sog_kn", 0.5),
     )
 
@@ -487,12 +560,83 @@ def motion_stratified_sample(
     return out
 
 
+def prepare_training_frame(
+    train_df: pd.DataFrame,
+    *,
+    sample_size: int | None,
+    maneuver_oversample: bool = False,
+    maneuver_fraction: float = 0.3,
+    motion_balanced_sample: bool = False,
+    straight_fraction: float = 0.15,
+    other_fraction: float = 0.15,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Apply oversampling / balancing on the training split only."""
+    if motion_balanced_sample and sample_size:
+        return motion_stratified_sample(
+            train_df,
+            sample_size,
+            straight_fraction=straight_fraction,
+            other_fraction=other_fraction,
+            seed=seed,
+        )
+    if maneuver_oversample and sample_size:
+        return maneuver_balanced_sample(
+            train_df,
+            sample_size,
+            maneuver_fraction=maneuver_fraction,
+            seed=seed,
+        )
+    if sample_size and len(train_df) > sample_size:
+        return train_df.sample(sample_size, random_state=seed).reset_index(drop=True)
+    return train_df.reset_index(drop=True)
+
+
+def make_train_val_test_frames(
+    df: pd.DataFrame,
+    *,
+    test_fraction: float,
+    val_fraction: float,
+    seed: int,
+    split_by: str = "trajectory",
+    train_sample_size: int | None = None,
+    maneuver_oversample: bool = False,
+    maneuver_fraction: float = 0.3,
+    motion_balanced_sample: bool = False,
+    straight_fraction: float = 0.15,
+    other_fraction: float = 0.15,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Split first, then balance/subsample training rows only."""
+    split_col = split_column(df, split_by)
+    train_ids, val_ids, test_ids = trajectory_splits(
+        df,
+        test_fraction=test_fraction,
+        val_fraction=val_fraction,
+        seed=seed,
+        split_by=split_by,
+    )
+    train_df = df.loc[mask_by_split(df, train_ids, split_col)].copy()
+    val_df = df.loc[mask_by_split(df, val_ids, split_col)].copy()
+    test_df = df.loc[mask_by_split(df, test_ids, split_col)].copy()
+    train_df = prepare_training_frame(
+        train_df,
+        sample_size=train_sample_size,
+        maneuver_oversample=maneuver_oversample,
+        maneuver_fraction=maneuver_fraction,
+        motion_balanced_sample=motion_balanced_sample,
+        straight_fraction=straight_fraction,
+        other_fraction=other_fraction,
+        seed=seed,
+    )
+    return train_df, val_df, test_df, split_col
+
+
 def compute_naive_cumulative_delta(
     x: np.ndarray,
     future_steps: int,
     feature_cols: list[str] | None = None,
 ) -> np.ndarray:
-    """Constant-velocity cumulative offset from anchor for each future step."""
+    """Constant last-step delta extrapolation (cumulative offset from anchor)."""
     cols = feature_cols or FEATURE_COLS
     dlat_idx = feature_index(cols, "dlat")
     dlon_idx = feature_index(cols, "dlon")
@@ -503,6 +647,58 @@ def compute_naive_cumulative_delta(
         [dlat[:, np.newaxis] * steps[np.newaxis, :], dlon[:, np.newaxis] * steps[np.newaxis, :]],
         axis=-1,
     )
+
+
+def compute_kinematic_cumulative_delta(
+    x: np.ndarray,
+    future_steps: int,
+    *,
+    feature_cols: list[str] | None = None,
+    step_minutes: float = 10.0,
+) -> np.ndarray:
+    """SOG+COG constant-velocity extrapolation as cumulative lat/lon offset from anchor."""
+    cols = feature_cols or FEATURE_COLS
+    lat_idx = feature_index(cols, "lat")
+    sog_idx = feature_index(cols, "sog")
+    cog_sin_idx = feature_index(cols, "cog_sin")
+    cog_cos_idx = feature_index(cols, "cog_cos")
+
+    last = x[:, -1, :]
+    lat0 = last[:, lat_idx].astype(np.float64)
+    sog_kn = last[:, sog_idx].astype(np.float64)
+    cog_sin = last[:, cog_sin_idx].astype(np.float64)
+    cog_cos = last[:, cog_cos_idx].astype(np.float64)
+
+    speed_kmh = sog_kn * NM_TO_KM
+    step_hours = step_minutes / 60.0
+    north_km = speed_kmh * cog_cos * step_hours
+    east_km = speed_kmh * cog_sin * step_hours
+
+    km_per_deg_lat = 111.322
+    cos_lat = np.cos(np.deg2rad(lat0)).clip(min=1e-3)
+    dlat_step = (north_km / km_per_deg_lat).astype(np.float32)
+    dlon_step = (east_km / (km_per_deg_lat * cos_lat)).astype(np.float32)
+
+    steps = np.arange(1, future_steps + 1, dtype=np.float32)
+    return np.stack(
+        [dlat_step[:, np.newaxis] * steps[np.newaxis, :], dlon_step[:, np.newaxis] * steps[np.newaxis, :]],
+        axis=-1,
+    )
+
+
+def baseline_cumulative_delta(
+    x: np.ndarray,
+    future_steps: int,
+    *,
+    kinematic: bool = False,
+    feature_cols: list[str] | None = None,
+    step_minutes: float = 10.0,
+) -> np.ndarray:
+    if kinematic:
+        return compute_kinematic_cumulative_delta(
+            x, future_steps, feature_cols=feature_cols, step_minutes=step_minutes
+        )
+    return compute_naive_cumulative_delta(x, future_steps, feature_cols=feature_cols)
 
 
 def compute_sample_weights(
@@ -555,6 +751,7 @@ def evaluate_stratified_positions(
     x_raw: np.ndarray,
     label_prefix: str,
     *,
+    anchor: np.ndarray | None = None,
     feature_cols: list[str] | None = None,
 ) -> list[dict[str, float]]:
     masks = classify_window_motion(x_raw, feature_cols)
@@ -567,6 +764,7 @@ def evaluate_stratified_positions(
                 y_true[mask],
                 y_pred[mask],
                 f"{label_prefix} [{name}, n={int(mask.sum())}]",
+                anchor=None if anchor is None else anchor[mask],
             )
         )
     return results
@@ -642,25 +840,32 @@ def trajectory_splits(
     test_fraction: float,
     val_fraction: float,
     seed: int,
+    *,
+    split_by: str = "trajectory",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    split_col = "traj_id" if "traj_id" in df.columns else "mmsi"
-    trajectories = df[split_col].drop_duplicates().to_numpy()
+    split_col = split_column(df, split_by)
+    groups = df[split_col].drop_duplicates().to_numpy()
     rng = np.random.default_rng(seed)
-    rng.shuffle(trajectories)
+    rng.shuffle(groups)
 
-    test_count = max(1, int(len(trajectories) * test_fraction))
-    val_count = max(1, int(len(trajectories) * val_fraction)) if val_fraction > 0 else 0
+    test_count = max(1, int(len(groups) * test_fraction))
+    val_count = max(1, int(len(groups) * val_fraction)) if val_fraction > 0 else 0
 
-    test_ids = trajectories[:test_count]
-    val_ids = trajectories[test_count : test_count + val_count]
-    train_ids = trajectories[test_count + val_count :]
+    test_ids = groups[:test_count]
+    val_ids = groups[test_count : test_count + val_count]
+    train_ids = groups[test_count + val_count :]
     return train_ids, val_ids, test_ids
 
 
-def mask_by_split(df: pd.DataFrame, ids: np.ndarray, split_col: str = "traj_id") -> np.ndarray:
-    if split_col not in df.columns:
-        split_col = "mmsi"
-    return df[split_col].isin(ids).to_numpy()
+def mask_by_split(
+    df: pd.DataFrame,
+    ids: np.ndarray,
+    split_col: str | None = None,
+    *,
+    split_by: str = "trajectory",
+) -> np.ndarray:
+    col = split_col or split_column(df, split_by)
+    return df[col].isin(ids).to_numpy()
 
 
 def horizon_step_index(df: pd.DataFrame, horizon_hours: float, future_steps: int) -> int:
@@ -702,6 +907,35 @@ def naive_position_at_horizon(
     return y_true, y_pred
 
 
+def kinematic_position_at_horizon(
+    x: np.ndarray,
+    y: np.ndarray,
+    horizon_step: int,
+    *,
+    feature_cols: list[str] | None = None,
+    step_minutes: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extrapolate using last SOG and COG (constant velocity)."""
+    cols = feature_cols or FEATURE_COLS
+    lat_idx = feature_index(cols, "lat")
+    lon_idx = feature_index(cols, "lon")
+    delta = compute_kinematic_cumulative_delta(
+        x,
+        horizon_step + 1,
+        feature_cols=cols,
+        step_minutes=step_minutes,
+    )
+    last = x[:, -1, :]
+    y_true = y[:, horizon_step, :]
+    y_pred = np.column_stack(
+        [
+            last[:, lat_idx] + delta[:, horizon_step, 0],
+            last[:, lon_idx] + delta[:, horizon_step, 1],
+        ]
+    )
+    return y_true, y_pred
+
+
 def naive_final_position(
     x: np.ndarray,
     y: np.ndarray,
@@ -726,6 +960,35 @@ def window_horizon_hours(df: pd.DataFrame, future_steps: int) -> float:
 
 NM_TO_KM = 1.852
 EARTH_RADIUS_KM = 6371.0
+DEFAULT_MIN_NORMALIZE_KM = 10.0
+
+
+def future_path_length_km(y_true: np.ndarray) -> np.ndarray:
+    """Sum of step distances along the true future trajectory, shape (N,)."""
+    if y_true.ndim != 3 or y_true.shape[1] < 2:
+        return np.zeros(len(y_true), dtype=np.float64)
+    seg = haversine_km(
+        y_true[:, :-1, 0],
+        y_true[:, :-1, 1],
+        y_true[:, 1:, 0],
+        y_true[:, 1:, 1],
+    )
+    return seg.sum(axis=1)
+
+
+def future_displacement_km(
+    y_true: np.ndarray,
+    anchor: np.ndarray,
+    *,
+    horizon_step: int | None = None,
+) -> np.ndarray:
+    """Great-circle distance from anchor to true position at horizon (or final step)."""
+    if y_true.ndim == 3:
+        step = (y_true.shape[1] - 1) if horizon_step is None else horizon_step
+        y_end = y_true[:, step, :]
+    else:
+        y_end = y_true
+    return haversine_km(anchor[:, 0], anchor[:, 1], y_end[:, 0], y_end[:, 1])
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> np.ndarray:
@@ -752,6 +1015,9 @@ def evaluate_final_position(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     label: str,
+    *,
+    anchor: np.ndarray | None = None,
+    min_normalize_km: float = DEFAULT_MIN_NORMALIZE_KM,
 ) -> dict[str, float]:
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
@@ -760,12 +1026,12 @@ def evaluate_final_position(
     )
     distance_nm = distance_km / NM_TO_KM
 
-    return {
+    out: dict[str, float] = {
         "model": label,
         "mae_lat": float(mean_absolute_error(y_true[:, 0], y_pred[:, 0])),
         "mae_lon": float(mean_absolute_error(y_true[:, 1], y_pred[:, 1])),
         "rmse_lat": float(np.sqrt(mean_squared_error(y_true[:, 0], y_pred[:, 0]))),
-        "rmse_lon": float(np.sqrt(mean_squared_error(y_true[:, 1], y_pred[:, 1]))),
+        "rmse_lon": float(np.sqrt(mean_squared_error(y_true[:, 1], y_pred[:, 1])),
         "r2_lat": float(r2_score(y_true[:, 0], y_pred[:, 0])),
         "r2_lon": float(r2_score(y_true[:, 1], y_pred[:, 1])),
         "mean_error_km": float(distance_km.mean()),
@@ -778,16 +1044,34 @@ def evaluate_final_position(
         "p95_error_nm": float(np.percentile(distance_nm, 95)),
     }
 
+    if anchor is not None:
+        denom = np.maximum(
+            future_displacement_km(y_true, anchor),
+            min_normalize_km,
+        )
+        nfde = distance_km / denom
+        out["mean_nfde"] = float(nfde.mean())
+        out["median_nfde"] = float(np.median(nfde))
+        out["p90_nfde"] = float(np.percentile(nfde, 90))
+        out["mean_future_displacement_km"] = float(denom.mean())
+
+    return out
+
 
 def evaluate_full_trajectory(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     label: str,
+    *,
+    min_normalize_km: float = DEFAULT_MIN_NORMALIZE_KM,
 ) -> dict[str, float]:
     distances_km = haversine_km(
         y_true[:, :, 0], y_true[:, :, 1], y_pred[:, :, 0], y_pred[:, :, 1]
     )
     distances_nm = distances_km / NM_TO_KM
+    ade_per_window = distances_km.mean(axis=1)
+    path_len = np.maximum(future_path_length_km(y_true), min_normalize_km)
+    nade = ade_per_window / path_len
 
     return {
         "model": label,
@@ -797,6 +1081,10 @@ def evaluate_full_trajectory(
         "mean_ade_nm": float(distances_nm.mean()),
         "median_ade_nm": float(np.median(distances_nm)),
         "final_step_mean_error_nm": float(distances_nm[:, -1].mean()),
+        "mean_nade": float(nade.mean()),
+        "median_nade": float(np.median(nade)),
+        "p90_nade": float(np.percentile(nade, 90)),
+        "mean_true_path_km": float(path_len.mean()),
     }
 
 
@@ -817,6 +1105,13 @@ def print_position_metrics(metrics: dict[str, float]) -> None:
             f"p95 {metrics['p95_error_km']:.3f} km "
             f"({metrics['p95_error_nm']:.3f} nm)"
         )
+        if "mean_nfde" in metrics:
+            print(
+                f"  Normalized FDE:  mean {metrics['mean_nfde']:.1%} | "
+                f"median {metrics['median_nfde']:.1%} | "
+                f"p90 {metrics['p90_nfde']:.1%} "
+                f"(÷ max(true displacement, {DEFAULT_MIN_NORMALIZE_KM:.0f} km))"
+            )
 
     if "mean_ade_km" in metrics:
         print(
@@ -825,3 +1120,11 @@ def print_position_metrics(metrics: dict[str, float]) -> None:
             f"median {metrics['median_ade_km']:.3f} km "
             f"({metrics['median_ade_nm']:.3f} nm)"
         )
+        if "mean_nade" in metrics:
+            print(
+                f"  Normalized ADE:  mean {metrics['mean_nade']:.1%} | "
+                f"median {metrics['median_nade']:.1%} | "
+                f"p90 {metrics['p90_nade']:.1%} "
+                f"(÷ max(true path length, {DEFAULT_MIN_NORMALIZE_KM:.0f} km), "
+                f"avg path {metrics['mean_true_path_km']:.1f} km)"
+            )

@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:A6000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=96G
-#SBATCH --time=12:00:00
+#SBATCH --time=08:00:00
 #SBATCH --partition=part-ugproj
 #SBATCH --qos=qos-ugproj
 
