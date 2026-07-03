@@ -34,6 +34,7 @@ PYTHONPATH="$PROJECT" $PYTHON -u models/RNN_AR.py \
     --lr 1e-3 \
     --patience 10 \
     --horizon-hours 12.0 \
-    --teacher-forcing 0.5
+    --filter-stationary \
+    --teacher-forcing 0.3
 
 echo "Job ended: $(date)"

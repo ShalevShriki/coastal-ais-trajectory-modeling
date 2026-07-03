@@ -19,18 +19,30 @@ from proj.project.coast_paths import COAST_CONFIGS, models_output_dir, resolve_w
 from proj.project.window_data import (
     FEATURE_COLS,
     build_window_arrays,
+    compute_sample_weights,
     evaluate_final_position,
     evaluate_full_trajectory,
+    evaluate_stratified_positions,
     haversine_km,
     horizon_step_index,
     infer_window_shape,
-    load_windows,
+    load_windows_filtered,
+    add_stationary_filter_args,
+    stationary_filter_from_args,
     mask_by_split,
     naive_position_at_horizon,
     print_position_metrics,
     scale_history_features,
     trajectory_splits,
     window_horizon_hours,
+)
+from proj.project.models.training_utils import (
+    TrajectoryLoss,
+    TrainingImprovementConfig,
+    add_training_improvement_args,
+    curriculum_train_steps,
+    scheduled_teacher_forcing,
+    training_config_from_args,
 )
 
 
@@ -63,16 +75,29 @@ class WindowDataset(Dataset):
         Shape: (2,)
     """
 
-    def __init__(self, x: np.ndarray, y_delta: np.ndarray, anchor: np.ndarray):
+    def __init__(
+        self,
+        x: np.ndarray,
+        y_delta: np.ndarray,
+        anchor: np.ndarray,
+        sample_weights: np.ndarray | None = None,
+    ):
         self.x = torch.tensor(x, dtype=torch.float32)
         self.y_delta = torch.tensor(y_delta, dtype=torch.float32)
         self.anchor = torch.tensor(anchor, dtype=torch.float32)
+        self.sample_weights = (
+            torch.tensor(sample_weights, dtype=torch.float32)
+            if sample_weights is not None
+            else None
+        )
 
     def __len__(self) -> int:
         return len(self.x)
 
     def __getitem__(self, idx: int):
-        return self.x[idx], self.y_delta[idx], self.anchor[idx]
+        if self.sample_weights is None:
+            return self.x[idx], self.y_delta[idx], self.anchor[idx]
+        return self.x[idx], self.y_delta[idx], self.anchor[idx], self.sample_weights[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +221,7 @@ class ShipTrajectoryARRNN(nn.Module):
 def train_one_epoch(
     model: ShipTrajectoryARRNN,
     dataloader: DataLoader,
-    criterion: nn.Module,
+    criterion,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     teacher_forcing_ratio: float,
@@ -206,16 +231,27 @@ def train_one_epoch(
     total_loss = 0.0
     total_count = 0
 
-    for batch_x, batch_y_delta, _ in dataloader:
+    for batch in dataloader:
+        if len(batch) == 4:
+            batch_x, batch_y_delta, batch_anchor, batch_weight = batch
+            batch_weight = batch_weight.to(device)
+        else:
+            batch_x, batch_y_delta, batch_anchor = batch
+            batch_weight = None
+
         batch_x = batch_x.to(device)
         batch_y_delta = batch_y_delta.to(device)
+        batch_anchor = batch_anchor.to(device)
 
         y_hat_delta = model(
             batch_x,
             target=batch_y_delta,
             teacher_forcing_ratio=teacher_forcing_ratio,
         )
-        loss = criterion(y_hat_delta, batch_y_delta)
+        if isinstance(criterion, TrajectoryLoss):
+            loss = criterion(y_hat_delta, batch_y_delta, batch_anchor, batch_weight)
+        else:
+            loss = criterion(y_hat_delta, batch_y_delta)
 
         optimizer.zero_grad()
         loss.backward()
@@ -233,7 +269,7 @@ def train_one_epoch(
 def evaluate_loss(
     model: ShipTrajectoryARRNN,
     dataloader: DataLoader,
-    criterion: nn.Module,
+    criterion,
     device: torch.device,
 ) -> float:
     model.eval()
@@ -241,13 +277,23 @@ def evaluate_loss(
     total_loss = 0.0
     total_count = 0
 
-    for batch_x, batch_y_delta, _ in dataloader:
+    for batch in dataloader:
+        if len(batch) == 4:
+            batch_x, batch_y_delta, batch_anchor, batch_weight = batch
+            batch_weight = batch_weight.to(device)
+        else:
+            batch_x, batch_y_delta, batch_anchor = batch
+            batch_weight = None
+
         batch_x = batch_x.to(device)
         batch_y_delta = batch_y_delta.to(device)
+        batch_anchor = batch_anchor.to(device)
 
-        # Pure autoregressive inference — no teacher forcing.
         y_hat_delta = model(batch_x)
-        loss = criterion(y_hat_delta, batch_y_delta)
+        if isinstance(criterion, TrajectoryLoss):
+            loss = criterion(y_hat_delta, batch_y_delta, batch_anchor, batch_weight)
+        else:
+            loss = criterion(y_hat_delta, batch_y_delta)
 
         batch_size = batch_x.size(0)
         total_loss += loss.item() * batch_size
@@ -394,7 +440,10 @@ def run_rnn_ar(
     sample_size: int | None,
     horizon_hours: float,
     teacher_forcing_ratio: float,
+    motion_filter=None,
+    training_config: TrainingImprovementConfig | None = None,
 ) -> Path:
+    training_config = training_config or TrainingImprovementConfig()
     start_time = time.perf_counter()
 
     input_path, coast, region = resolve_windows_path(coast_name, region, input_path)
@@ -412,7 +461,14 @@ def run_rnn_ar(
     # -----------------------------------------------------------------------
 
     print(f"Loading windows from: {input_path}")
-    df = load_windows(input_path, sample_size=sample_size)
+    df = load_windows_filtered(
+        input_path,
+        sample_size=sample_size,
+        motion_filter=motion_filter,
+        maneuver_oversample=training_config.maneuver_oversample,
+        maneuver_fraction=training_config.maneuver_fraction,
+        seed=seed,
+    )
 
     tag = f"RNN_AR_{rnn_type.upper()}"
     output_dir = results_output_dir(coast, input_path, tag, df)
@@ -482,12 +538,18 @@ def run_rnn_ar(
 
     x_test_raw = x_test.copy()
 
+    train_weights = (
+        compute_sample_weights(x[train_mask])
+        if training_config.difficulty_weighting
+        else None
+    )
+
     x_train, [x_val, x_test], scaler = scale_history_features(
         x_train,
         [x_val, x_test],
     )
 
-    train_dataset = WindowDataset(x_train, y_delta_train, anchor_train)
+    train_dataset = WindowDataset(x_train, y_delta_train, anchor_train, train_weights)
     val_dataset   = WindowDataset(x_val,   y_delta_val,   anchor_val)
     test_dataset  = WindowDataset(x_test,  y_delta_test,  anchor_test)
 
@@ -534,7 +596,15 @@ def run_rnn_ar(
         rnn_type=rnn_type,
     ).to(device)
 
-    criterion = nn.HuberLoss(delta=0.01)
+    criterion = TrajectoryLoss(haversine_weight=training_config.haversine_weight)
+    resample_minutes = (
+        int(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10
+    )
+    base_tf = teacher_forcing_ratio
+    print(
+        f"Loss: Huber + Haversine (w={training_config.haversine_weight:.2f}) | "
+        f"TF start={base_tf:.2f} scheduled={'on' if training_config.scheduled_teacher_forcing else 'off'}"
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=3, factor=0.5
@@ -566,13 +636,35 @@ def run_rnn_ar(
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
 
+        if training_config.scheduled_teacher_forcing:
+            epoch_tf = scheduled_teacher_forcing(
+                epoch,
+                epochs,
+                start=base_tf,
+                end=training_config.teacher_forcing_end,
+            )
+        else:
+            epoch_tf = teacher_forcing_ratio
+
+        if training_config.curriculum:
+            train_steps = curriculum_train_steps(
+                epoch,
+                epochs,
+                future_steps,
+                resample_minutes=resample_minutes,
+                start_hours=training_config.curriculum_start_hours,
+            )
+            criterion.set_train_steps(train_steps)
+        else:
+            criterion.set_train_steps(None)
+
         train_loss = train_one_epoch(
             model=model,
             dataloader=train_loader,
             criterion=criterion,
             optimizer=optimizer,
             device=device,
-            teacher_forcing_ratio=teacher_forcing_ratio,
+            teacher_forcing_ratio=epoch_tf,
         )
 
         val_loss = evaluate_loss(
@@ -602,7 +694,12 @@ def run_rnn_ar(
             f"time: {epoch_elapsed:6.2f}s | "
             f"train loss {train_loss:10.6f} | "
             f"valid loss {val_loss:10.6f} | "
-            f"lr {current_lr:.2e}"
+            f"lr {current_lr:.2e} | tf {epoch_tf:.2f}"
+            + (
+                f" | steps {criterion.train_steps}/{future_steps}"
+                if training_config.curriculum and criterion.train_steps
+                else ""
+            )
         )
 
         if val_loss < best_val_loss:
@@ -620,6 +717,8 @@ def run_rnn_ar(
             break
 
     print("-" * 70)
+
+    criterion.set_train_steps(None)
 
     peak_gpu_mb = (
         torch.cuda.max_memory_allocated(device) / (1024 ** 2)
@@ -686,6 +785,14 @@ def run_rnn_ar(
             f"{model_name}: full predicted trajectory",
         ),
     ]
+    metrics.extend(
+        evaluate_stratified_positions(
+            eval_true,
+            eval_pred,
+            x_test_raw,
+            f"{model_name}: position ({actual_horizon_hours:.1f} h ahead)",
+        )
+    )
 
     for item in metrics:
         print_position_metrics(item)
@@ -871,6 +978,9 @@ def main() -> None:
         help="Probability of using ground-truth delta as decoder input during training (0=free-running, 1=always teacher).",
     )
 
+    add_stationary_filter_args(parser)
+    add_training_improvement_args(parser)
+
     args = parser.parse_args()
 
     if args.region is None:
@@ -899,6 +1009,8 @@ def main() -> None:
         sample_size=None if args.sample <= 0 else args.sample,
         horizon_hours=args.horizon_hours,
         teacher_forcing_ratio=args.teacher_forcing,
+        motion_filter=stationary_filter_from_args(args),
+        training_config=training_config_from_args(args),
     )
 
 

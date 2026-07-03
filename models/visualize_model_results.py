@@ -48,8 +48,29 @@ COLORS = {
     "rnn": "#FF9800",
     "rnn_ar": "#2E7D32",
     "rnn_ar_mid": "#66BB6A",
+    "transformer": "#7B1FA2",
 }
-LABELS = {"rnn": "LSTM (flat)", "rnn_ar": "LSTM-AR"}
+LABELS = {
+    "rnn": "LSTM (flat)",
+    "rnn_ar": "LSTM-AR",
+    "transformer": "Transformer",
+}
+
+
+def active_models(
+    traj_rnn: dict | None,
+    traj_ar: dict | None,
+    traj_transformer: dict | None,
+) -> list[tuple[str, dict]]:
+    out: list[tuple[str, dict]] = []
+    for tag, traj in [
+        ("rnn", traj_rnn),
+        ("rnn_ar", traj_ar),
+        ("transformer", traj_transformer),
+    ]:
+        if traj is not None:
+            out.append((tag, traj))
+    return out
 
 
 def load_json(path: Path) -> dict:
@@ -102,8 +123,7 @@ def _save(fig: plt.Figure, path: Path) -> None:
 
 def plot_error_vs_horizon(
     metrics: dict,
-    traj_rnn: dict | None,
-    traj_ar: dict | None,
+    models: list[tuple[str, dict]],
     out: Path,
 ) -> None:
     sm = step_minutes(metrics)
@@ -118,9 +138,7 @@ def plot_error_vs_horizon(
     ]
 
     for ax, (stat_name, fn) in zip(axes, stat_fns):
-        for tag, traj in [("rnn", traj_rnn), ("rnn_ar", traj_ar)]:
-            if traj is None:
-                continue
+        for tag, traj in models:
             yt, yp = traj["y_true"], traj["y_pred"]
             vals = np.array([
                 fn(haversine_nm(yt[:, t, 0], yt[:, t, 1], yp[:, t, 0], yp[:, t, 1]))
@@ -141,8 +159,7 @@ def plot_error_vs_horizon(
 
 def plot_multi_horizon_histograms(
     metrics: dict,
-    traj_rnn: dict | None,
-    traj_ar: dict | None,
+    models: list[tuple[str, dict]],
     horizon_hours: list[float],
     out: Path,
 ) -> None:
@@ -154,9 +171,7 @@ def plot_multi_horizon_histograms(
     axes = np.atleast_1d(axes).ravel()
 
     for ax, (h_label, step) in zip(axes, horizons):
-        for tag, traj in [("rnn", traj_rnn), ("rnn_ar", traj_ar)]:
-            if traj is None:
-                continue
+        for tag, traj in models:
             errs = per_sample_errors_at_step(traj["y_true"], traj["y_pred"], step)
             ax.hist(errs, bins=50, alpha=0.55, color=COLORS[tag], label=LABELS[tag])
         ax.set_xlabel("Error (nm)")
@@ -175,54 +190,39 @@ def plot_multi_horizon_histograms(
 
 def plot_ade_boxplot(
     metrics: dict,
-    traj_rnn: dict | None,
-    traj_ar: dict | None,
+    models: list[tuple[str, dict]],
     horizon_hours: list[float],
     out: Path,
 ) -> None:
     horizons = resolve_horizon_steps(metrics, horizon_hours)
     labels = [f"{h:.0f}h" for h, _ in horizons]
 
-    data_rnn, data_ar = [], []
-    for _, step in horizons:
-        if traj_rnn is not None:
-            data_rnn.append(per_sample_errors_at_step(traj_rnn["y_true"], traj_rnn["y_pred"], step))
-        if traj_ar is not None:
-            data_ar.append(per_sample_errors_at_step(traj_ar["y_true"], traj_ar["y_pred"], step))
-
-    n_models = sum(x is not None for x in (traj_rnn, traj_ar))
-    if n_models == 0:
+    if not models:
         return
 
-    width = 0.35
+    n_models = len(models)
+    width = 0.8 / n_models
     x = np.arange(len(labels))
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    offset = -width / 2 if n_models == 2 else 0
-    if traj_rnn is not None:
+    for mi, (tag, traj) in enumerate(models):
+        data = [
+            per_sample_errors_at_step(traj["y_true"], traj["y_pred"], step)
+            for _, step in horizons
+        ]
+        offset = (mi - (n_models - 1) / 2) * width
         bp = ax.boxplot(
-            data_rnn, positions=x + offset, widths=width, patch_artist=True,
+            data, positions=x + offset, widths=width * 0.9, patch_artist=True,
             medianprops=dict(color="black", linewidth=1.5),
         )
         for patch in bp["boxes"]:
-            patch.set_facecolor(COLORS["rnn"])
-            patch.set_alpha(0.7)
-        offset += width
-
-    if traj_ar is not None:
-        bp = ax.boxplot(
-            data_ar, positions=x + offset, widths=width, patch_artist=True,
-            medianprops=dict(color="black", linewidth=1.5),
-        )
-        for patch in bp["boxes"]:
-            patch.set_facecolor(COLORS["rnn_ar"])
+            patch.set_facecolor(COLORS[tag])
             patch.set_alpha(0.7)
 
-    legend_patches = []
-    if traj_rnn is not None:
-        legend_patches.append(plt.matplotlib.patches.Patch(color=COLORS["rnn"], alpha=0.7, label=LABELS["rnn"]))
-    if traj_ar is not None:
-        legend_patches.append(plt.matplotlib.patches.Patch(color=COLORS["rnn_ar"], alpha=0.7, label=LABELS["rnn_ar"]))
+    legend_patches = [
+        plt.matplotlib.patches.Patch(color=COLORS[tag], alpha=0.7, label=LABELS[tag])
+        for tag, _ in models
+    ]
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
@@ -236,7 +236,7 @@ def plot_ade_boxplot(
 
 
 def plot_trajectory_basemap(
-    traj_rnn: dict | None,
+    models: list[tuple[str, dict]],
     traj_ar: dict | None,
     n_vessels: int,
     out: Path,
@@ -252,7 +252,7 @@ def plot_trajectory_basemap(
 
     to_merc = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
-    ref = traj_ar or traj_rnn
+    ref = traj_ar or (models[0][1] if models else None)
     if ref is None:
         return
 
@@ -301,12 +301,6 @@ def plot_trajectory_basemap(
         ax.plot(gx, gy, color=COLORS["gt"], linewidth=1.8, alpha=0.75, zorder=4)
         ax.scatter(gx[-1], gy[-1], s=40, marker="o", color=COLORS["gt"], zorder=5)
 
-        if traj_rnn is not None:
-            pred = traj_rnn["y_pred"][i]
-            px, py = to_merc.transform(pred[:, 1], pred[:, 0])
-            ax.plot(px, py, color=COLORS["rnn"], linewidth=1.5, alpha=0.8, linestyle="--", zorder=3)
-            ax.scatter(px[-1], py[-1], s=50, marker="X", color=COLORS["rnn"], zorder=5)
-
         if traj_ar is not None:
             pred = traj_ar["y_pred"][i]
             px, py = to_merc.transform(pred[:, 1], pred[:, 0])
@@ -318,19 +312,33 @@ def plot_trajectory_basemap(
                        edgecolors="white", linewidths=0.6, zorder=5, alpha=0.95)
             ax.scatter(px[-1], py[-1], s=50, marker="D", color=COLORS["rnn_ar"], zorder=5)
 
+        for tag, traj in models:
+            if tag == "rnn_ar":
+                continue
+            pred = traj["y_pred"][i]
+            px, py = to_merc.transform(pred[:, 1], pred[:, 0])
+            linestyle = "--" if tag == "rnn" else "-."
+            marker = "X" if tag == "rnn" else "P"
+            ax.plot(px, py, color=COLORS[tag], linewidth=1.5, alpha=0.8, linestyle=linestyle, zorder=3)
+            ax.scatter(px[-1], py[-1], s=50, marker=marker, color=COLORS[tag], zorder=5)
+
     from matplotlib.lines import Line2D
     legend_elems = [
         Line2D([0], [0], marker="s", color="w", markerfacecolor=COLORS["anchor"], markersize=8, label="Anchor"),
         Line2D([0], [0], color=COLORS["gt"], linewidth=2, label="Ground truth"),
     ]
-    if traj_rnn is not None:
-        legend_elems.append(Line2D([0], [0], color=COLORS["rnn"], linewidth=2, linestyle="--", label=LABELS["rnn"]))
-    if traj_ar is not None:
-        legend_elems.append(Line2D([0], [0], color=COLORS["rnn_ar"], linewidth=2, label=LABELS["rnn_ar"]))
-        legend_elems.append(
-            Line2D([0], [0], marker="o", color="w", markerfacecolor=COLORS["rnn_ar_mid"],
-                   markersize=7, label="AR intermediate steps")
-        )
+    for tag, _ in models:
+        if tag == "rnn_ar":
+            legend_elems.append(Line2D([0], [0], color=COLORS["rnn_ar"], linewidth=2, label=LABELS["rnn_ar"]))
+            legend_elems.append(
+                Line2D([0], [0], marker="o", color="w", markerfacecolor=COLORS["rnn_ar_mid"],
+                       markersize=7, label="AR intermediate steps")
+            )
+        else:
+            linestyle = "--" if tag == "rnn" else "-."
+            legend_elems.append(
+                Line2D([0], [0], color=COLORS[tag], linewidth=2, linestyle=linestyle, label=LABELS[tag])
+            )
     ax.legend(handles=legend_elems, loc="upper right", fontsize=9)
     ax.set_title(
         f"Sample trajectories (n={n}) — AR middle points every {mid_every_steps} steps",
@@ -350,6 +358,7 @@ def _legend_html(extra: str = "") -> str:
         <span style="color:{COLORS['gt']}">&#9644;</span> Ground truth<br>
         <span style="color:{COLORS['rnn']}">&#9644;</span> LSTM flat prediction<br>
         <span style="color:{COLORS['rnn_ar']}">&#9644;</span> LSTM-AR prediction<br>
+        <span style="color:{COLORS['transformer']}">&#9644;</span> Transformer prediction<br>
         <span style="color:{COLORS['rnn_ar_mid']}">&#9679;</span> AR intermediate steps<br>
         {extra}
     </div>
@@ -357,7 +366,7 @@ def _legend_html(extra: str = "") -> str:
 
 
 def build_ar_unroll_map(
-    traj_rnn: dict | None,
+    models: list[tuple[str, dict]],
     traj_ar: dict,
     n_vessels: int,
     out: Path,
@@ -406,11 +415,14 @@ def build_ar_unroll_map(
                 popup=f"AR step {t + 1} ({h_ahead:.1f} h) | err {err_km:.2f} km",
             ).add_to(m)
 
-        if traj_rnn is not None:
-            rnn_pred = traj_rnn["y_pred"][i]
-            rnn_pts = [[float(rnn_pred[t, 0]), float(rnn_pred[t, 1])] for t in range(rnn_pred.shape[0])]
+        for tag, traj in models:
+            if tag == "rnn_ar":
+                continue
+            pred = traj["y_pred"][i]
+            pts = [[float(pred[t, 0]), float(pred[t, 1])] for t in range(pred.shape[0])]
+            dash = "6" if tag == "rnn" else "4 6"
             folium.PolyLine(
-                [anchor_pt] + rnn_pts, color=COLORS["rnn"], weight=1.5, opacity=0.65, dash_array="6",
+                [anchor_pt] + pts, color=COLORS[tag], weight=1.5, opacity=0.65, dash_array=dash,
             ).add_to(m)
 
     m.save(str(out))
@@ -418,7 +430,7 @@ def build_ar_unroll_map(
 
 
 def build_horizon_map(
-    traj_rnn: dict | None,
+    models: list[tuple[str, dict]],
     traj_ar: dict | None,
     horizon_label: float,
     step: int,
@@ -433,7 +445,7 @@ def build_horizon_map(
         print("  folium not installed — skipping map")
         return
 
-    ref = traj_ar or traj_rnn
+    ref = traj_ar or (models[0][1] if models else None)
     if ref is None:
         return
 
@@ -466,18 +478,21 @@ def build_horizon_map(
             fill_opacity=0.9, popup=f"GT @ {horizon_label:.1f}h",
         ).add_to(m)
 
-        if traj_rnn is not None:
-            pred = traj_rnn["y_pred"][i]
+        for tag, traj in models:
+            if tag == "rnn_ar":
+                continue
+            pred = traj["y_pred"][i]
             pred_slice = pred[: step + 1]
-            rnn_pts = [[float(pred_slice[t, 0]), float(pred_slice[t, 1])] for t in range(pred_slice.shape[0])]
+            pts = [[float(pred_slice[t, 0]), float(pred_slice[t, 1])] for t in range(pred_slice.shape[0])]
+            dash = "5" if tag == "rnn" else "4 6"
             folium.PolyLine(
-                [anchor_pt] + rnn_pts, color=COLORS["rnn"], weight=1.5, opacity=0.7, dash_array="5",
+                [anchor_pt] + pts, color=COLORS[tag], weight=1.5, opacity=0.7, dash_array=dash,
             ).add_to(m)
-            rnn_end = [float(pred[step, 0]), float(pred[step, 1])]
+            end = [float(pred[step, 0]), float(pred[step, 1])]
             err = float(haversine_km(gt[step, 0], gt[step, 1], pred[step, 0], pred[step, 1]))
             folium.RegularPolygonMarker(
-                rnn_end, number_of_sides=4, radius=5, color=COLORS["rnn"], fill=True,
-                fill_opacity=0.9, popup=f"LSTM flat err {err:.2f} km",
+                end, number_of_sides=4, radius=5, color=COLORS[tag], fill=True,
+                fill_opacity=0.9, popup=f"{LABELS[tag]} err {err:.2f} km",
             ).add_to(m)
 
         if traj_ar is not None:
@@ -525,6 +540,8 @@ def main() -> None:
     parser.add_argument("--trajs", type=Path, default=None)
     parser.add_argument("--ar-metrics", type=Path, default=None)
     parser.add_argument("--ar-trajs", type=Path, default=None)
+    parser.add_argument("--transformer-metrics", type=Path, default=None)
+    parser.add_argument("--transformer-trajs", type=Path, default=None)
     parser.add_argument("--auto-discover", action="store_true")
     parser.add_argument("--rnn-type", default="lstm")
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -548,53 +565,65 @@ def main() -> None:
     metrics = load_json(args.metrics)
     traj_rnn = load_traj(args.trajs) if args.trajs and args.trajs.exists() else None
     traj_ar = load_traj(args.ar_trajs) if args.ar_trajs and args.ar_trajs.exists() else None
+    traj_transformer = (
+        load_traj(args.transformer_trajs)
+        if args.transformer_trajs and args.transformer_trajs.exists()
+        else None
+    )
+    models = active_models(traj_rnn, traj_ar, traj_transformer)
 
-    if traj_rnn is None and traj_ar is None:
-        sys.exit("No trajectory JSON found. Run RNN.py / RNN_AR.py first.")
+    if not models:
+        sys.exit("No trajectory JSON found. Run RNN.py / RNN_AR.py / transformers.py first.")
 
-    outdir = args.output_dir or (args.metrics.parent / "visualizations")
+    outdir = args.output_dir or (args.metrics.parent.parent / "visualizations")
     outdir.mkdir(parents=True, exist_ok=True)
     sm = step_minutes(metrics)
 
     print(f"\nVisualizing results → {outdir}")
-    print(f"  metrics : {args.metrics}")
+    print(f"  RNN     : {args.metrics}")
     if args.ar_metrics:
         print(f"  AR      : {args.ar_metrics}")
+    if args.transformer_metrics:
+        print(f"  Xformer : {args.transformer_metrics}")
+    print(f"  Models  : {', '.join(LABELS[t] for t, _ in models)}")
     print()
 
     print("Error vs horizon curve...")
-    plot_error_vs_horizon(metrics, traj_rnn, traj_ar, outdir / "error_vs_horizon.png")
+    plot_error_vs_horizon(metrics, models, outdir / "error_vs_horizon.png")
 
     print("Multi-horizon histograms...")
     plot_multi_horizon_histograms(
-        metrics, traj_rnn, traj_ar, horizon_hours, outdir / "error_hist_multi_horizon.png",
+        metrics, models, horizon_hours, outdir / "error_hist_multi_horizon.png",
     )
 
     print("ADE boxplots...")
-    plot_ade_boxplot(metrics, traj_rnn, traj_ar, horizon_hours, outdir / "ade_boxplot_horizons.png")
+    plot_ade_boxplot(metrics, models, horizon_hours, outdir / "ade_boxplot_horizons.png")
 
     print("Static basemap...")
     plot_trajectory_basemap(
-        traj_rnn, traj_ar, args.n_vessels, outdir / "trajectory_basemap.png",
+        models, traj_ar, args.n_vessels, outdir / "trajectory_basemap.png",
         mid_every_steps=args.ar_mid_every,
     )
 
     if traj_ar is not None:
         print("AR unroll map (all middle points)...")
         build_ar_unroll_map(
-            traj_rnn, traj_ar, args.n_vessels, outdir / "map_ar_unroll.html",
+            models, traj_ar, args.n_vessels, outdir / "map_ar_unroll.html",
             mid_every_steps=1, step_min=sm,
         )
 
     print("Per-horizon maps...")
     for h_label, step in resolve_horizon_steps(metrics, horizon_hours):
         build_horizon_map(
-            traj_rnn, traj_ar, h_label, step, args.n_vessels,
+            models, traj_ar, h_label, step, args.n_vessels,
             outdir / f"map_horizon_{h_label:.0f}h.html",
             step_min=sm,
         )
 
-    print(f"\nDone. Open {outdir / 'map_ar_unroll.html'} for interactive AR middle points.\n")
+    print("\nDone.")
+    if traj_ar is not None:
+        print(f"  AR middle points: {outdir / 'map_ar_unroll.html'}")
+    print(f"  Horizon maps:     {outdir / 'map_horizon_*.html'}\n")
 
 
 if __name__ == "__main__":

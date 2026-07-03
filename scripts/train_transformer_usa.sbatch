@@ -35,6 +35,7 @@ PYTHONPATH="$PROJECT" $PYTHON -u models/transformers.py \
     --lr 1e-3 \
     --weight-decay 1e-4 \
     --patience 10 \
-    --horizon-hours 12.0
+    --horizon-hours 12.0 \
+    --filter-stationary
 
 echo "Job ended: $(date)"

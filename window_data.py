@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -83,7 +84,14 @@ def default_window_path(
     )
 
 
-def load_windows(path: Path, sample_size: int | None = None) -> pd.DataFrame:
+def load_windows(
+    path: Path,
+    sample_size: int | None = None,
+    *,
+    maneuver_oversample: bool = False,
+    maneuver_fraction: float = 0.3,
+    seed: int = 42,
+) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
             f"Missing {path}. Run PROCESS_noaa_long_coastal.py or INCREMENTAL_PROCESS.py first."
@@ -115,8 +123,342 @@ def load_windows(path: Path, sample_size: int | None = None) -> pd.DataFrame:
     del frames
 
     if len(df) > sample_size:
-        df = df.sample(sample_size, random_state=42).reset_index(drop=True)
+        if maneuver_oversample:
+            df = maneuver_balanced_sample(
+                df, sample_size, maneuver_fraction=maneuver_fraction, seed=seed
+            )
+        else:
+            df = df.sample(sample_size, random_state=seed).reset_index(drop=True)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Stationary / confined-window filter
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StationaryFilterConfig:
+    """Drop windows where the vessel barely leaves a small geographic cell."""
+
+    enabled: bool = True
+    # Max distance from anchor to any history/future point (the "cell" radius).
+    max_confined_radius_km: float = 0.5
+    # Net displacement anchor → final future position.
+    min_future_displacement_km: float = 1.0
+    # Optional: mean SOG below this (knots) reinforces stationary classification.
+    min_mean_sog_kn: float = 0.5
+
+
+def _track_path_length_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    if lat.shape[1] < 2:
+        return np.zeros(lat.shape[0], dtype=np.float64)
+    seg = haversine_km(lat[:, :-1], lon[:, :-1], lat[:, 1:], lon[:, 1:])
+    return seg.sum(axis=1)
+
+
+def compute_window_motion_metrics(
+    df: pd.DataFrame,
+    history_steps: int | None = None,
+    future_steps: int | None = None,
+) -> pd.DataFrame:
+    """
+  Per-window motion stats from history + future lat/lon (and SOG when present).
+
+    Confined windows: high path_length with tiny max_radius = wiggling in place.
+    """
+    if history_steps is None or future_steps is None:
+        history_steps, future_steps = infer_window_shape(df)
+
+    lat_hist = df[[f"x_t{t:03d}_lat" for t in range(history_steps)]].to_numpy(dtype=np.float64)
+    lon_hist = df[[f"x_t{t:03d}_lon" for t in range(history_steps)]].to_numpy(dtype=np.float64)
+    lat_fut = df[[f"y_t{t:03d}_lat" for t in range(future_steps)]].to_numpy(dtype=np.float64)
+    lon_fut = df[[f"y_t{t:03d}_lon" for t in range(future_steps)]].to_numpy(dtype=np.float64)
+
+    anchor_lat = lat_hist[:, -1]
+    anchor_lon = lon_hist[:, -1]
+    all_lat = np.concatenate([lat_hist, lat_fut], axis=1)
+    all_lon = np.concatenate([lon_hist, lon_fut], axis=1)
+
+    dist_from_anchor = haversine_km(
+        anchor_lat[:, np.newaxis],
+        anchor_lon[:, np.newaxis],
+        all_lat,
+        all_lon,
+    )
+    max_radius_km = dist_from_anchor.max(axis=1)
+    future_displacement_km = haversine_km(
+        anchor_lat, anchor_lon, lat_fut[:, -1], lon_fut[:, -1]
+    )
+    history_displacement_km = haversine_km(
+        lat_hist[:, 0], lon_hist[:, 0], anchor_lat, anchor_lon
+    )
+    path_length_km = _track_path_length_km(all_lat, all_lon)
+
+    sog_cols = [f"x_t{t:03d}_sog" for t in range(history_steps)]
+    sog_cols += [f"y_t{t:03d}_sog" for t in range(future_steps)]
+    if all(c in df.columns for c in sog_cols):
+        mean_sog_kn = df[sog_cols].to_numpy(dtype=np.float64).mean(axis=1)
+    else:
+        mean_sog_kn = np.full(len(df), np.nan, dtype=np.float64)
+
+    return pd.DataFrame(
+        {
+            "max_radius_km": max_radius_km,
+            "future_displacement_km": future_displacement_km,
+            "history_displacement_km": history_displacement_km,
+            "path_length_km": path_length_km,
+            "mean_sog_kn": mean_sog_kn,
+        }
+    )
+
+
+def stationary_window_mask(
+    metrics: pd.DataFrame,
+    config: StationaryFilterConfig,
+) -> np.ndarray:
+    """
+    True = boring / confined window (candidate for removal).
+
+    Primary rule: stays inside a small cell AND barely moves net over 12h future.
+    Secondary: very low SOG + low future displacement.
+    """
+    confined = metrics["max_radius_km"] <= config.max_confined_radius_km
+    short_future = metrics["future_displacement_km"] < config.min_future_displacement_km
+    primary = confined & short_future
+
+    if np.isfinite(metrics["mean_sog_kn"]).any():
+        slow = metrics["mean_sog_kn"] < config.min_mean_sog_kn
+        secondary = slow & short_future & confined
+        return (primary | secondary).to_numpy()
+    return primary.to_numpy()
+
+
+def filter_stationary_windows(
+    df: pd.DataFrame,
+    config: StationaryFilterConfig,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    if not config.enabled or df.empty:
+        return df, {"removed": 0.0, "kept_fraction": 1.0}
+
+    metrics = compute_window_motion_metrics(df)
+    remove = stationary_window_mask(metrics, config)
+    n_removed = int(remove.sum())
+    n_total = len(df)
+
+    stats = {
+        "windows_total": float(n_total),
+        "windows_removed": float(n_removed),
+        "windows_kept": float(n_total - n_removed),
+        "removed_fraction": float(n_removed / max(n_total, 1)),
+        "kept_fraction": float((n_total - n_removed) / max(n_total, 1)),
+        "median_max_radius_km_removed": float(metrics.loc[remove, "max_radius_km"].median())
+        if n_removed
+        else 0.0,
+        "median_max_radius_km_kept": float(metrics.loc[~remove, "max_radius_km"].median())
+        if n_removed < n_total
+        else 0.0,
+    }
+
+    if n_removed == 0:
+        return df, stats
+
+    return df.loc[~remove].reset_index(drop=True), stats
+
+
+def print_stationary_filter_stats(stats: dict[str, float], config: StationaryFilterConfig) -> None:
+    print(
+        f"Stationary filter: radius≤{config.max_confined_radius_km:.2f} km & "
+        f"future disp<{config.min_future_displacement_km:.2f} km "
+        f"(SOG<{config.min_mean_sog_kn:.1f} kn reinforces)"
+    )
+    print(
+        f"  removed {int(stats['windows_removed']):,} / {int(stats['windows_total']):,} "
+        f"({stats['removed_fraction'] * 100:.1f}%) | "
+        f"kept {int(stats['windows_kept']):,}"
+    )
+
+
+def add_stationary_filter_args(parser) -> None:
+    parser.add_argument(
+        "--filter-stationary",
+        action="store_true",
+        help="Drop confined/low-motion windows (wiggling in place near a dock).",
+    )
+    parser.add_argument(
+        "--max-confined-radius-km",
+        type=float,
+        default=0.5,
+        help="Max radius from anchor to classify as confined (default: 0.5 km).",
+    )
+    parser.add_argument(
+        "--min-future-displacement-km",
+        type=float,
+        default=1.0,
+        help="Min net future displacement to keep a confined window (default: 1.0 km).",
+    )
+    parser.add_argument(
+        "--min-mean-sog-kn",
+        type=float,
+        default=0.5,
+        help="Mean SOG below this reinforces stationary removal (default: 0.5 kn).",
+    )
+
+
+def stationary_filter_from_args(args) -> StationaryFilterConfig:
+    return StationaryFilterConfig(
+        enabled=getattr(args, "filter_stationary", False),
+        max_confined_radius_km=getattr(args, "max_confined_radius_km", 0.5),
+        min_future_displacement_km=getattr(args, "min_future_displacement_km", 1.0),
+        min_mean_sog_kn=getattr(args, "min_mean_sog_kn", 0.5),
+    )
+
+
+def load_windows_filtered(
+    path: Path,
+    sample_size: int | None = None,
+    motion_filter: StationaryFilterConfig | None = None,
+    *,
+    maneuver_oversample: bool = False,
+    maneuver_fraction: float = 0.3,
+    seed: int = 42,
+) -> pd.DataFrame:
+    df = load_windows(
+        path,
+        sample_size=sample_size,
+        maneuver_oversample=maneuver_oversample,
+        maneuver_fraction=maneuver_fraction,
+        seed=seed,
+    )
+    if motion_filter is not None and motion_filter.enabled:
+        df, stats = filter_stationary_windows(df, motion_filter)
+        print_stationary_filter_stats(stats, motion_filter)
+    return df
+
+
+def compute_maneuver_scores_df(df: pd.DataFrame, history_steps: int | None = None) -> np.ndarray:
+    """Higher score = more course/speed changes in history."""
+    if history_steps is None:
+        history_steps, _ = infer_window_shape(df)
+
+    dcog_cols = [f"x_t{t:03d}_dcog" for t in range(history_steps)]
+    dsog_cols = [f"x_t{t:03d}_dsog" for t in range(history_steps)]
+    score = np.zeros(len(df), dtype=np.float64)
+    if all(c in df.columns for c in dcog_cols):
+        score += np.abs(df[dcog_cols].to_numpy(dtype=np.float64)).mean(axis=1)
+    if all(c in df.columns for c in dsog_cols):
+        score += np.abs(df[dsog_cols].to_numpy(dtype=np.float64)).mean(axis=1)
+    return score
+
+
+def maneuver_balanced_sample(
+    df: pd.DataFrame,
+    sample_size: int,
+    *,
+    maneuver_fraction: float = 0.3,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """70/30 style split: random + high-maneuver windows."""
+    if len(df) <= sample_size:
+        return df.reset_index(drop=True)
+
+    history_steps, _ = infer_window_shape(df)
+    scores = compute_maneuver_scores_df(df, history_steps)
+    rng = np.random.default_rng(seed)
+
+    n_maneuver = int(round(sample_size * maneuver_fraction))
+    n_random = sample_size - n_maneuver
+
+    order = np.argsort(scores)
+    maneuver_pool = order[-max(n_maneuver * 4, n_maneuver) :]
+    random_pool = order[: max(len(order) - len(maneuver_pool), 1)]
+
+    m_pick = rng.choice(
+        maneuver_pool,
+        size=min(n_maneuver, len(maneuver_pool)),
+        replace=len(maneuver_pool) < n_maneuver,
+    )
+    r_pick = rng.choice(
+        random_pool,
+        size=min(n_random, len(random_pool)),
+        replace=len(random_pool) < n_random,
+    )
+    idx = np.unique(np.concatenate([m_pick, r_pick]))
+    if len(idx) < sample_size:
+        remaining = np.setdiff1d(np.arange(len(df)), idx)
+        extra = rng.choice(
+            remaining,
+            size=min(sample_size - len(idx), len(remaining)),
+            replace=False,
+        )
+        idx = np.concatenate([idx, extra])
+    return df.iloc[idx[:sample_size]].reset_index(drop=True)
+
+
+def compute_sample_weights(
+    x_raw: np.ndarray,
+    feature_cols: list[str] | None = None,
+) -> np.ndarray:
+    """Boost loss on windows with larger |dcog|/|dsog| in history."""
+    cols = feature_cols or FEATURE_COLS
+    weight = np.ones(len(x_raw), dtype=np.float32)
+    try:
+        dcog_idx = feature_index(cols, "dcog")
+        dsog_idx = feature_index(cols, "dsog")
+        score = np.abs(x_raw[:, :, dcog_idx]).mean(axis=1) + np.abs(
+            x_raw[:, :, dsog_idx]
+        ).mean(axis=1)
+        scale = float(np.median(score) + 1e-6)
+        weight = (1.0 + score / scale).astype(np.float32)
+    except KeyError:
+        pass
+    return weight
+
+
+def classify_window_motion(
+    x_raw: np.ndarray,
+    feature_cols: list[str] | None = None,
+) -> dict[str, np.ndarray]:
+    """Stratified test buckets: straight / maneuver / anchored / other."""
+    cols = feature_cols or FEATURE_COLS
+    sog_idx = feature_index(cols, "sog")
+    dcog_idx = feature_index(cols, "dcog")
+
+    mean_sog = x_raw[:, :, sog_idx].mean(axis=1)
+    max_dcog = np.abs(x_raw[:, :, dcog_idx]).max(axis=1)
+
+    anchored = mean_sog < 1.0
+    maneuver = max_dcog > 15.0
+    straight = (mean_sog >= 5.0) & (max_dcog < 5.0) & ~anchored
+    other = ~(anchored | maneuver | straight)
+    return {
+        "straight": straight,
+        "maneuver": maneuver,
+        "anchored": anchored,
+        "other": other,
+    }
+
+
+def evaluate_stratified_positions(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    x_raw: np.ndarray,
+    label_prefix: str,
+    *,
+    feature_cols: list[str] | None = None,
+) -> list[dict[str, float]]:
+    masks = classify_window_motion(x_raw, feature_cols)
+    results: list[dict[str, float]] = []
+    for name, mask in masks.items():
+        if not np.any(mask):
+            continue
+        results.append(
+            evaluate_final_position(
+                y_true[mask],
+                y_pred[mask],
+                f"{label_prefix} [{name}, n={int(mask.sum())}]",
+            )
+        )
+    return results
 
 
 def infer_window_shape(df: pd.DataFrame) -> tuple[int, int]:

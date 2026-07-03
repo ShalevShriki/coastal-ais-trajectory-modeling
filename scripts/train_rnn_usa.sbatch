@@ -33,6 +33,7 @@ PYTHONPATH="$PROJECT" $PYTHON -u models/RNN.py \
     --epochs 60 \
     --lr 1e-3 \
     --patience 10 \
-    --horizon-hours 12.0
+    --horizon-hours 12.0 \
+    --filter-stationary
 
 echo "Job ended: $(date)"
