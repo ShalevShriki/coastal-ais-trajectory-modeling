@@ -61,11 +61,13 @@ class TrajectoryLoss(nn.Module):
         huber_delta: float = 0.01,
         relative_weight: float = 0.0,
         min_path_km: float = 10.0,
+        target_mode: str = "anchor_offset",
     ):
         super().__init__()
         self.haversine_weight = float(haversine_weight)
         self.relative_weight = float(relative_weight)
         self.min_path_km = float(min_path_km)
+        self.target_mode = str(target_mode)
         self.huber = nn.HuberLoss(delta=huber_delta, reduction="none")
         self.train_steps: int | None = None
 
@@ -86,8 +88,12 @@ class TrajectoryLoss(nn.Module):
         huber = self.huber(pred_delta, true_delta).mean(dim=(1, 2))
 
         anchor_exp = anchor.unsqueeze(1)
-        pred_abs = anchor_exp + pred_delta
-        true_abs = anchor_exp + true_delta
+        if self.target_mode == "step_delta":
+            pred_abs = anchor_exp + torch.cumsum(pred_delta, dim=1)
+            true_abs = anchor_exp + torch.cumsum(true_delta, dim=1)
+        else:
+            pred_abs = anchor_exp + pred_delta
+            true_abs = anchor_exp + true_delta
         dist_km = local_km_error_torch(
             true_abs[..., 0], true_abs[..., 1], pred_abs[..., 0], pred_abs[..., 1]
         )
@@ -315,6 +321,39 @@ def add_training_improvement_args(parser) -> None:
         action="store_true",
         help="(AR only) Disable scheduled teacher forcing decay.",
     )
+
+
+def enrich_history_row(
+    *,
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+    lr: float,
+    epoch_sec: float,
+    train_steps: int | None = None,
+    future_steps: int | None = None,
+    teacher_forcing: float | None = None,
+    train_eval_loss: float | None = None,
+    test_loss: float | None = None,
+) -> dict[str, float]:
+    row: dict[str, float] = {
+        "epoch": float(epoch),
+        "train_loss": float(train_loss),
+        "val_loss": float(val_loss),
+        "lr": float(lr),
+        "epoch_sec": float(epoch_sec),
+    }
+    if train_steps is not None:
+        row["train_steps"] = float(train_steps)
+    if future_steps is not None:
+        row["future_steps"] = float(future_steps)
+    if teacher_forcing is not None:
+        row["teacher_forcing"] = float(teacher_forcing)
+    if train_eval_loss is not None:
+        row["train_eval_loss"] = float(train_eval_loss)
+    if test_loss is not None:
+        row["test_loss"] = float(test_loss)
+    return row
 
 
 def training_config_from_args(args) -> TrainingImprovementConfig:
