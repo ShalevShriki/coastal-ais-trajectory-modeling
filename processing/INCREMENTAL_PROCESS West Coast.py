@@ -8,7 +8,12 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 import requests
+
+
+def _parquet_row_count(path: Path) -> int:
+    return pq.ParquetFile(path).metadata.num_rows
 
 _PROCESS_PATH = Path(__file__).with_name("PROCESS_noaa_long_coastal West Coast.py")
 _spec = importlib.util.spec_from_file_location("process_west_coast", _PROCESS_PATH)
@@ -75,29 +80,46 @@ def mark_day_processed(day: date, region_label: str) -> None:
     path.write_text("\n".join(sorted(processed)) + "\n", encoding="utf-8")
 
 
-def download_day(day: date) -> Path:
+def download_day(day: date, *, max_attempts: int = 5) -> Path:
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     zst_path = TEMP_DIR / archive_name(day)
-    if zst_path.exists():
+    if zst_path.exists() and zst_path.stat().st_size > 1_000_000:
         return zst_path
 
     url = download_url(day)
-    print(f"Downloading {url} ...", flush=True)
-    start = time.perf_counter()
-    with requests.get(url, stream=True, timeout=300) as response:
-        if response.status_code == 404:
-            raise FileNotFoundError(f"No AIS file for {day_tag(day)} at {url}")
-        response.raise_for_status()
-        with zst_path.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    handle.write(chunk)
-    print(
-        f"Downloaded {zst_path.name} ({zst_path.stat().st_size / 1e9:.2f} GB) "
-        f"in {format_duration(time.perf_counter() - start)}",
-        flush=True,
-    )
-    return zst_path
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        if zst_path.exists():
+            zst_path.unlink()
+        print(f"Downloading {url} (attempt {attempt}/{max_attempts}) ...", flush=True)
+        start = time.perf_counter()
+        try:
+            with requests.get(url, stream=True, timeout=(30, 600)) as response:
+                if response.status_code == 404:
+                    raise FileNotFoundError(f"No AIS file for {day_tag(day)} at {url}")
+                response.raise_for_status()
+                with zst_path.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+            if zst_path.stat().st_size < 1_000_000:
+                raise OSError(f"Download too small: {zst_path.stat().st_size} bytes")
+            print(
+                f"Downloaded {zst_path.name} ({zst_path.stat().st_size / 1e9:.2f} GB) "
+                f"in {format_duration(time.perf_counter() - start)}",
+                flush=True,
+            )
+            return zst_path
+        except (requests.RequestException, OSError, IOError) as exc:
+            last_error = exc
+            print(f"Download failed: {exc}", flush=True)
+            if zst_path.exists():
+                zst_path.unlink()
+            if attempt < max_attempts:
+                wait = min(60, 5 * attempt)
+                print(f"Retrying in {wait}s ...", flush=True)
+                time.sleep(wait)
+    raise RuntimeError(f"Failed to download {url} after {max_attempts} attempts") from last_error
 
 
 def resolve_input_path(day: date, local_input: Path | None) -> Path:
@@ -221,15 +243,19 @@ def run_incremental(
 
     for idx, day in enumerate(days, start=1):
         print(f"\n=== Day {idx}/{total_days}: {day_tag(day)} ===", flush=True)
-        rows_kept = process_day(
-            day,
-            commercial_only,
-            region_label=dataset_label,
-            source=args.source,
-            lat_range=lat_range,
-            lon_range=lon_range,
-            keep_raw=keep_raw,
-        )
+        try:
+            rows_kept = process_day(
+                day,
+                commercial_only,
+                region_label=dataset_label,
+                source=args.source,
+                lat_range=lat_range,
+                lon_range=lon_range,
+                keep_raw=keep_raw,
+            )
+        except Exception as exc:
+            print(f"ERROR on {day_tag(day)}: {exc}", flush=True)
+            continue
         total_kept += rows_kept
         if rows_kept:
             print(f"Day kept rows: {rows_kept:,}", flush=True)
@@ -238,8 +264,7 @@ def run_incremental(
 
     if finalize_at_end and any(days_dir(dataset_label).glob("*.parquet")):
         final_path = finalize(args)
-        df = pd.read_parquet(final_path)
-        print(f"Final output: {final_path} | samples: {len(df):,}", flush=True)
+        print(f"Final output: {final_path} | samples: {_parquet_row_count(final_path):,}", flush=True)
 
     print(f"Total runtime: {format_duration(time.perf_counter() - pipeline_start)}", flush=True)
 
@@ -283,8 +308,7 @@ def main() -> None:
 
     if args.finalize_only:
         final_path = finalize(args)
-        df = pd.read_parquet(final_path)
-        print(f"Final output: {final_path} | samples: {len(df):,}")
+        print(f"Final output: {final_path} | samples: {_parquet_row_count(final_path):,}")
         return
 
     if args.input:
@@ -303,8 +327,7 @@ def main() -> None:
         )
         if not args.no_finalize and any(days_dir(dataset_label).glob("*.parquet")):
             final_path = finalize(args)
-            df = pd.read_parquet(final_path)
-            print(f"Final output: {final_path} | samples: {len(df):,}")
+            print(f"Final output: {final_path} | samples: {_parquet_row_count(final_path):,}")
         return
 
     if not args.start_date or not args.end_date:

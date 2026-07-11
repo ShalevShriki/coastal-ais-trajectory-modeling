@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 from proj.project.coast_paths import COAST_CONFIGS, models_output_dir, resolve_windows_path, results_output_dir
 from proj.project.window_data import (
@@ -29,6 +29,7 @@ from proj.project.window_data import (
     haversine_km,
     horizon_step_index,
     infer_window_shape,
+    resolve_window_hours,
     kinematic_position_at_horizon,
     load_windows_filtered,
     add_stationary_filter_args,
@@ -39,12 +40,14 @@ from proj.project.window_data import (
     scale_history_features,
     window_horizon_hours,
 )
+from proj.project.models.plot_utils import save_training_history_plot
 from proj.project.models.training_utils import (
     TrajectoryLoss,
     TrainingImprovementConfig,
     add_training_improvement_args,
     apply_residual_prediction,
     curriculum_train_steps,
+    enrich_history_row,
     training_config_from_args,
     training_improvements_dict,
     unpack_window_batch,
@@ -524,26 +527,6 @@ def predict_absolute_positions(
 # Metrics and plots
 # ============================================================
 
-def save_training_plot(history: list[dict[str, float]], output_path: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    epochs = [row["epoch"] for row in history]
-    train_loss = [row["train_loss"] for row in history]
-    val_loss = [row["val_loss"] for row in history]
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, train_loss, label="Train loss")
-    ax.plot(epochs, val_loss, label="Validation loss")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Huber loss")
-    ax.set_title("Transformer Training History")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.35)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    plt.close(fig)
-
-
 def save_error_histogram(
     y_true_final: np.ndarray,
     y_pred_final: np.ndarray,
@@ -632,8 +615,11 @@ def run_transformer(
     seed: int,
     sample_size: int | None,
     horizon_hours: float,
+    history_hours: float | None = None,
+    future_hours: float | None = None,
     motion_filter=None,
     training_config: TrainingImprovementConfig | None = None,
+    run_tag: str | None = None,
 ) -> Path:
     training_config = training_config or TrainingImprovementConfig()
     start_time = time.perf_counter()
@@ -664,17 +650,20 @@ def run_transformer(
         seed=seed,
     )
 
-    output_dir = results_output_dir(coast, input_path, "Transformer", df)
-    model_dir = models_output_dir(coast, input_path, df)
+    output_dir = results_output_dir(coast, input_path, "Transformer", df, run_tag=run_tag)
+    model_dir = models_output_dir(coast, input_path, df, run_tag=run_tag)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    history_steps, future_steps = infer_window_shape(df)
-    window_hours = window_horizon_hours(df, future_steps)
-    horizon_step = horizon_step_index(df, horizon_hours, future_steps)
-    step_minutes = (
-        float(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10.0
+    full_history_steps, full_future_steps, history_steps, future_steps, step_minutes = (
+        resolve_window_hours(
+            df,
+            history_hours=history_hours,
+            future_hours=future_hours,
+        )
     )
+    window_hours = future_steps * step_minutes / 60
+    horizon_step = horizon_step_index(df, horizon_hours, future_steps)
     actual_horizon_hours = (
         (horizon_step + 1) * step_minutes / 60
         if "resample_minutes" in df.columns
@@ -696,13 +685,22 @@ def run_transformer(
     )
 
     x_train, y_abs_train, y_delta_train, anchor_train = build_window_arrays(
-        train_df, history_steps=history_steps, future_steps=future_steps
+        train_df,
+        history_steps=history_steps,
+        future_steps=future_steps,
+        full_history_steps=full_history_steps,
     )
     x_val, _, y_delta_val, anchor_val = build_window_arrays(
-        val_df, history_steps=history_steps, future_steps=future_steps
+        val_df,
+        history_steps=history_steps,
+        future_steps=future_steps,
+        full_history_steps=full_history_steps,
     )
     x_test, y_test_abs, y_delta_test, anchor_test = build_window_arrays(
-        test_df, history_steps=history_steps, future_steps=future_steps
+        test_df,
+        history_steps=history_steps,
+        future_steps=future_steps,
+        full_history_steps=full_history_steps,
     )
 
     use_kinematic = training_config.kinematic_baseline
@@ -732,9 +730,9 @@ def run_transformer(
     print(f"Samples loaded: {len(df):,}")
     print(f"Unique {split_label}: {num_entities:,} (split by {training_config.split_by})")
     print(
-        f"Window: history={history_steps} steps | "
-        f"future={future_steps} steps | "
-        f"window={window_hours:.1f} h | "
+        f"Window: history={history_steps} steps ({history_steps * step_minutes / 60:.1f}h"
+        f" of {full_history_steps}) | "
+        f"future={future_steps} steps ({window_hours:.1f}h) | "
         f"eval horizon={actual_horizon_hours:.1f} h (step {horizon_step + 1}/{future_steps})"
     )
     print(f"Features: {FEATURE_COLS}")
@@ -770,6 +768,20 @@ def run_transformer(
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    train_eval_size = min(len(train_dataset), max(len(val_dataset), 10_000))
+    train_eval_idx = np.random.default_rng(seed).choice(
+        len(train_dataset), size=train_eval_size, replace=False
+    )
+    train_eval_loader = DataLoader(
+        Subset(
+            WindowDataset(x_train, y_delta_train, anchor_train, None, naive_train),
+            train_eval_idx.tolist(),
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
 
     # -----------------------------------------------------------------------
     # Model, loss, optimizer
@@ -868,6 +880,13 @@ def run_transformer(
             device=device,
             residual_naive=training_config.residual_naive,
         )
+        train_eval_loss = evaluate_loss(
+            model=model,
+            dataloader=train_eval_loader,
+            criterion=criterion,
+            device=device,
+            residual_naive=training_config.residual_naive,
+        )
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -875,13 +894,16 @@ def run_transformer(
         total_train_time += epoch_elapsed
 
         history.append(
-            {
-                "epoch": epoch,
-                "train_loss": float(train_loss),
-                "val_loss": float(val_loss),
-                "lr": current_lr,
-                "epoch_sec": float(epoch_elapsed),
-            }
+            enrich_history_row(
+                epoch=epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                lr=current_lr,
+                epoch_sec=epoch_elapsed,
+                train_steps=train_steps_cur if training_config.curriculum else future_steps,
+                future_steps=future_steps,
+                train_eval_loss=train_eval_loss,
+            )
         )
 
         print(
@@ -889,6 +911,7 @@ def run_transformer(
             f"time: {epoch_elapsed:6.2f}s | "
             f"train loss {train_loss:10.6f} | "
             f"valid loss {val_loss:10.6f} | "
+            f"train eval {train_eval_loss:10.6f} | "
             f"lr {current_lr:.2e}"
             + (
                 f" | train steps {train_steps_cur}/{future_steps}"
@@ -926,6 +949,16 @@ def run_transformer(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+
+    best_epoch = int(min(history, key=lambda row: row["val_loss"])["epoch"])
+    test_loss_at_best = evaluate_loss(
+        model=model,
+        dataloader=test_loader,
+        criterion=criterion,
+        device=device,
+        residual_naive=training_config.residual_naive,
+    )
+    print(f"Test loss @ best epoch {best_epoch}: {test_loss_at_best:.6f}")
 
     # -----------------------------------------------------------------------
     # Test evaluation
@@ -1049,6 +1082,9 @@ def run_transformer(
         "features": FEATURE_COLS,
         "history_steps": int(history_steps),
         "future_steps": int(future_steps),
+        "full_history_steps": int(full_history_steps),
+        "history_hours": float(history_steps * step_minutes / 60),
+        "future_hours": float(window_hours),
         "window_hours": float(window_hours),
         "horizon_hours_requested": float(horizon_hours),
         "horizon_hours_actual": float(actual_horizon_hours),
@@ -1085,13 +1121,30 @@ def run_transformer(
         },
         "metrics": metrics,
         "history": history,
+        "eval_summary": {
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
+            "test_loss_at_best": float(test_loss_at_best),
+        },
         "runtime_sec": round(time.perf_counter() - start_time, 2),
     }
 
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    save_training_plot(history, output_dir / "transformer_training_history.png")
+    save_training_history_plot(
+        history,
+        output_dir / "transformer_training_history.png",
+        title="Transformer Training History",
+        loss_label="Huber + Haversine loss",
+        autoregressive=False,
+        future_steps=future_steps,
+        resample_minutes=resample_minutes,
+        curriculum_start_hours=training_config.curriculum_start_hours,
+        curriculum_enabled=training_config.curriculum,
+        test_loss_at_best=test_loss_at_best,
+        test_epoch=best_epoch,
+    )
 
     save_error_histogram(
         eval_true,
@@ -1172,6 +1225,26 @@ def main() -> None:
         help="How far ahead to evaluate (must fit inside the future window in the parquet).",
     )
 
+    parser.add_argument(
+        "--history-hours",
+        type=float,
+        default=None,
+        help="Use last N hours of history (suffix ending at anchor). Default: full parquet history.",
+    )
+
+    parser.add_argument(
+        "--future-hours",
+        type=float,
+        default=None,
+        help="Use first N hours of future for train/eval. Default: full parquet future.",
+    )
+
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default=None,
+        help="Optional subdirectory under results/models (e.g. experiment1/v1_baseline).",
+    )
     add_stationary_filter_args(parser)
     add_training_improvement_args(parser)
 
@@ -1204,8 +1277,11 @@ def main() -> None:
         seed=args.seed,
         sample_size=None if args.sample <= 0 else args.sample,
         horizon_hours=args.horizon_hours,
+        history_hours=args.history_hours,
+        future_hours=args.future_hours,
         motion_filter=stationary_filter_from_args(args),
         training_config=training_config_from_args(args),
+        run_tag=args.run_tag,
     )
 
 

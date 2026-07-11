@@ -22,11 +22,16 @@ data/results/**/*.log
 *.h5
 *.hdf5
 
-# Model checkpoints (binary weights only — Python source in models/ is tracked)
-data/models/
+# Model checkpoints: track under data/models/ as experiment anchors;
+# ignore loose *.pt elsewhere in the tree.
 *.pt
 *.pth
 *.ckpt
+!data/models/
+!data/models/**/
+!data/models/**/*.pt
+!data/models/**/*.pth
+!data/models/**/*.ckpt
 
 # Logs and outputs
 *.out

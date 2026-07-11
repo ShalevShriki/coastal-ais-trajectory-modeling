@@ -8,7 +8,12 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 import requests
+
+
+def _parquet_row_count(path: Path) -> int:
+    return pq.ParquetFile(path).metadata.num_rows
 
 _PROCESS_PATH = Path(__file__).with_name("PROCESS_noaa_long_coastal Mexcany Beach.py")
 _spec = importlib.util.spec_from_file_location("process_mexican_coast", _PROCESS_PATH)
@@ -238,8 +243,7 @@ def run_incremental(
 
     if finalize_at_end and any(days_dir(dataset_label).glob("*.parquet")):
         final_path = finalize(args)
-        df = pd.read_parquet(final_path)
-        print(f"Final output: {final_path} | samples: {len(df):,}", flush=True)
+        print(f"Final output: {final_path} | samples: {_parquet_row_count(final_path):,}", flush=True)
 
     print(f"Total runtime: {format_duration(time.perf_counter() - pipeline_start)}", flush=True)
 
@@ -283,8 +287,7 @@ def main() -> None:
 
     if args.finalize_only:
         final_path = finalize(args)
-        df = pd.read_parquet(final_path)
-        print(f"Final output: {final_path} | samples: {len(df):,}")
+        print(f"Final output: {final_path} | samples: {_parquet_row_count(final_path):,}")
         return
 
     if args.input:
@@ -303,8 +306,7 @@ def main() -> None:
         )
         if not args.no_finalize and any(days_dir(dataset_label).glob("*.parquet")):
             final_path = finalize(args)
-            df = pd.read_parquet(final_path)
-            print(f"Final output: {final_path} | samples: {len(df):,}")
+            print(f"Final output: {final_path} | samples: {_parquet_row_count(final_path):,}")
         return
 
     if not args.start_date or not args.end_date:

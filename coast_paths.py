@@ -218,15 +218,23 @@ def results_output_dir(
     dataset_path: Path,
     model_name: str,
     df: pd.DataFrame | None = None,
+    run_tag: str | None = None,
 ) -> Path:
     days_label = days_label_for_dataset(dataset_path, df)
-    return coast.results_root / days_label / model_name
+    base = coast.results_root / days_label
+    if run_tag:
+        base = base / run_tag
+    return base / model_name
 
 
 def models_output_dir(
     coast: CoastConfig,
     dataset_path: Path,
     df: pd.DataFrame | None = None,
+    run_tag: str | None = None,
 ) -> Path:
     days_label = days_label_for_dataset(dataset_path, df)
-    return Path("data/models") / coast.name / days_label
+    base = Path("data/models") / coast.name / days_label
+    if run_tag:
+        base = base / run_tag
+    return base

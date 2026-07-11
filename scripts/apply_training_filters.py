@@ -28,12 +28,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from proj.project.window_data import (
+    SmartMotionFilterConfig,
     StationaryFilterConfig,
     classify_window_motion,
+    compute_history_motion_metrics,
     compute_maneuver_scores_df,
+    compute_smart_motion_metrics,
     compute_window_motion_metrics,
     filter_stationary_windows,
     infer_window_shape,
+    smart_motion_window_mask,
     stationary_window_mask,
 )
 
@@ -64,6 +68,7 @@ def filter_parquet_incremental(
     src: Path,
     dst: Path,
     config: StationaryFilterConfig,
+    smart_config: SmartMotionFilterConfig | None = None,
     *,
     batch_size: int = 50_000,
 ) -> dict:
@@ -88,10 +93,20 @@ def filter_parquet_incremental(
         full_df = batch.to_pandas()
         total_in += len(full_df)
 
-        remove = stationary_window_mask(
-            compute_window_motion_metrics(full_df, history_steps, future_steps),
-            config,
-        )
+        remove = np.zeros(len(full_df), dtype=bool)
+        if config.enabled:
+            remove = stationary_window_mask(
+                (
+                    compute_history_motion_metrics(full_df, history_steps)
+                    if config.history_only
+                    else compute_window_motion_metrics(full_df, history_steps, future_steps)
+                ),
+                config,
+            )
+        if smart_config is not None and smart_config.enabled:
+            smart_metrics = compute_smart_motion_metrics(full_df, history_steps, future_steps)
+            remove = remove | smart_motion_window_mask(smart_metrics, smart_config)
+
         keep = ~remove
 
         if keep.any():
@@ -99,8 +114,13 @@ def filter_parquet_incremental(
 
             scores = compute_maneuver_scores_df(filtered, history_steps)
             maneuver_scores.append(scores)
-            m = compute_window_motion_metrics(filtered, history_steps, future_steps)
-            radius_kept.extend(m["max_radius_km"].tolist())
+            m = (
+                compute_history_motion_metrics(filtered, history_steps)
+                if config.history_only
+                else compute_window_motion_metrics(filtered, history_steps, future_steps)
+            )
+            radius_col = "history_max_radius_km" if config.history_only else "max_radius_km"
+            radius_kept.extend(m[radius_col].tolist())
 
             total_out += len(filtered)
             table = pa.Table.from_pandas(filtered, preserve_index=False)
@@ -207,34 +227,108 @@ def main() -> None:
         default=Path("data/processed/combined_filtered"),
     )
     parser.add_argument("--max-confined-radius-km", type=float, default=0.5)
-    parser.add_argument("--min-future-displacement-km", type=float, default=1.0)
+    parser.add_argument(
+        "--min-displacement-km",
+        type=float,
+        default=1.0,
+        help="Min net displacement over history (default) or future if --filter-use-future.",
+    )
     parser.add_argument("--min-mean-sog-kn", type=float, default=0.5)
+    parser.add_argument(
+        "--filter-use-future",
+        action="store_true",
+        help="Legacy filter: use future window motion (leaks labels; not recommended).",
+    )
+    parser.add_argument(
+        "--require-min-history-displacement-km",
+        type=float,
+        default=0.0,
+        help="Require 24h history net displacement >= this km (default: 0 = off).",
+    )
+    parser.add_argument(
+        "--require-min-history-path-km",
+        type=float,
+        default=0.0,
+        help="Require 24h history path length >= this km (default: 0 = off).",
+    )
+    parser.add_argument(
+        "--max-history-loop-ratio",
+        type=float,
+        default=None,
+        help="Drop ferries/local loops: remove if history net/path below this (e.g. 0.35).",
+    )
+    parser.add_argument("--min-path-for-loop-km", type=float, default=10.0)
+    parser.add_argument(
+        "--smart-motion",
+        action="store_true",
+        help="Require last 16h/8h of history show real movement (drops arrived-and-stopped).",
+    )
+    parser.add_argument("--smart-min-16h-net-km", type=float, default=8.0)
+    parser.add_argument("--smart-min-last-8h-net-km", type=float, default=2.0)
+    parser.add_argument("--smart-max-loop-ratio", type=float, default=0.35)
+    parser.add_argument(
+        "--skip-stationary",
+        action="store_true",
+        help="Do not re-apply confined/stationary filter (input is already filtered).",
+    )
     parser.add_argument("--sample", type=int, default=400_000)
     parser.add_argument("--maneuver-fraction", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     config = StationaryFilterConfig(
-        enabled=True,
+        enabled=not args.skip_stationary,
+        history_only=not args.filter_use_future,
         max_confined_radius_km=args.max_confined_radius_km,
-        min_future_displacement_km=args.min_future_displacement_km,
+        min_displacement_km=args.min_displacement_km,
         min_mean_sog_kn=args.min_mean_sog_kn,
+        require_min_history_displacement_km=args.require_min_history_displacement_km,
+        require_min_history_path_km=args.require_min_history_path_km,
+        max_history_loop_ratio=args.max_history_loop_ratio,
+        min_path_for_loop_km=args.min_path_for_loop_km,
+    )
+
+    smart_config = SmartMotionFilterConfig(
+        enabled=args.smart_motion,
+        min_history_16h_net_km=args.smart_min_16h_net_km,
+        min_history_last_8h_net_km=args.smart_min_last_8h_net_km,
+        max_history_loop_ratio=args.smart_max_loop_ratio,
     )
 
     report: dict = {
         "filter": {
+            "history_only": config.history_only,
             "max_confined_radius_km": config.max_confined_radius_km,
-            "min_future_displacement_km": config.min_future_displacement_km,
+            "min_displacement_km": config.min_displacement_km,
             "min_mean_sog_kn": config.min_mean_sog_kn,
+            "require_min_history_displacement_km": config.require_min_history_displacement_km,
+            "require_min_history_path_km": config.require_min_history_path_km,
+            "max_history_loop_ratio": config.max_history_loop_ratio,
+            "min_path_for_loop_km": config.min_path_for_loop_km,
+        },
+        "smart_motion": {
+            "enabled": smart_config.enabled,
+            "min_history_16h_net_km": smart_config.min_history_16h_net_km,
+            "min_history_last_8h_net_km": smart_config.min_history_last_8h_net_km,
+            "max_history_loop_ratio": smart_config.max_history_loop_ratio,
+            "audit_min_future_8h_net_km": smart_config.audit_min_future_8h_net_km,
+            "audit_min_future_12h_net_km": smart_config.audit_min_future_12h_net_km,
         },
         "splits": {},
     }
 
     print("=== Applying stationary filter to combined splits ===")
+    scope = "history-only" if config.history_only else "history+future"
     print(
-        f"radius≤{config.max_confined_radius_km} km & "
-        f"future<{config.min_future_displacement_km} km\n"
+        f"mode={scope} | radius≤{config.max_confined_radius_km} km & "
+        f"displacement<{config.min_displacement_km} km\n"
     )
+    if smart_config.enabled:
+        print(
+            f"smart-motion: last-16h net≥{smart_config.min_history_16h_net_km} km, "
+            f"last-8h net≥{smart_config.min_history_last_8h_net_km} km, "
+            f"loop ratio≥{smart_config.max_history_loop_ratio}\n"
+        )
 
     for name in ("train.parquet", "val.parquet", "test.parquet"):
         src = args.input_dir / name
@@ -243,7 +337,9 @@ def main() -> None:
             continue
         dst = args.output_dir / name
         print(f"Processing {name}...")
-        report["splits"][name] = filter_parquet_incremental(src, dst, config)
+        report["splits"][name] = filter_parquet_incremental(
+            src, dst, config, smart_config=smart_config
+        )
 
     train_out = args.output_dir / "train.parquet"
     if train_out.exists():

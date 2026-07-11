@@ -160,6 +160,13 @@ class StationaryFilterConfig:
     min_displacement_km: float = 1.0
     # Optional: mean SOG below this (knots) reinforces stationary classification.
     min_mean_sog_kn: float = 0.5
+    # Require meaningful history motion (net START→END of 24h history).
+    require_min_history_displacement_km: float = 0.0
+    # Require total history path length (filters micro-wiggles that pass net disp).
+    require_min_history_path_km: float = 0.0
+    # Drop local loops: net/path below this when path exceeds min_path_for_loop_km.
+    max_history_loop_ratio: float | None = None
+    min_path_for_loop_km: float = 10.0
 
     @property
     def min_future_displacement_km(self) -> float:
@@ -167,7 +174,152 @@ class StationaryFilterConfig:
         return self.min_displacement_km
 
 
+@dataclass
+class SmartMotionFilterConfig:
+    """
+    History-only filter for vessels that are still moving into the forecast window.
+
+    Catches "arrived and stopped" windows: high 24h displacement but the last 8h
+    of history are nearly stationary (vessel reached destination before t=0).
+  """
+
+    enabled: bool = True
+    # Net displacement over the last 16h of history (steps at 10 min).
+    min_history_16h_net_km: float = 8.0
+    # Net displacement over the last 8h of history ending at anchor.
+    min_history_last_8h_net_km: float = 2.0
+    # Drop small/local loops only (low net/path in a confined area).
+    # Large loops (long path or wide radius, e.g. ferries) are kept.
+    max_history_loop_ratio: float = 0.35
+    min_path_for_loop_km: float = 10.0
+    min_big_loop_path_km: float = 50.0
+    max_local_loop_radius_km: float = 20.0
+    # Audit thresholds (future motion, for reports only — not used to drop rows).
+    audit_min_future_8h_net_km: float = 5.0
+    audit_min_future_12h_net_km: float = 5.0
+
+
 def _track_path_length_km(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    if lat.shape[1] < 2:
+        return np.zeros(lat.shape[0], dtype=np.float64)
+    seg = haversine_km(lat[:, :-1], lon[:, :-1], lat[:, 1:], lon[:, 1:])
+    return seg.sum(axis=1)
+
+
+def _history_step_slices(history_steps: int) -> tuple[int, int, int]:
+    """Return (start_16h, start_8h, anchor) step indices for 10-min windows."""
+    anchor = history_steps - 1
+    steps_16h = min(history_steps, int(round(16 * 60 / 10)))
+    steps_8h = min(history_steps, int(round(8 * 60 / 10)))
+    return max(0, anchor - steps_16h + 1), max(0, anchor - steps_8h + 1), anchor
+
+
+def _future_horizon_step(future_steps: int, hours: float) -> int:
+    step = int(round(hours * 60 / 10)) - 1
+    return max(0, min(step, future_steps - 1))
+
+
+def compute_smart_motion_metrics(
+    df: pd.DataFrame,
+    history_steps: int | None = None,
+    future_steps: int | None = None,
+) -> pd.DataFrame:
+    """
+    History + future motion stats for smart filtering and audit.
+
+    Filter uses history columns only. Future columns are for offline audit.
+    """
+    if history_steps is None or future_steps is None:
+        history_steps, future_steps = infer_window_shape(df)
+
+    lat_hist = df[[f"x_t{t:03d}_lat" for t in range(history_steps)]].to_numpy(dtype=np.float64)
+    lon_hist = df[[f"x_t{t:03d}_lon" for t in range(history_steps)]].to_numpy(dtype=np.float64)
+    lat_fut = df[[f"y_t{t:03d}_lat" for t in range(future_steps)]].to_numpy(dtype=np.float64)
+    lon_fut = df[[f"y_t{t:03d}_lon" for t in range(future_steps)]].to_numpy(dtype=np.float64)
+
+    i16, i8, anchor = _history_step_slices(history_steps)
+    anchor_lat = lat_hist[:, anchor]
+    anchor_lon = lon_hist[:, anchor]
+
+    history_full_net_km = haversine_km(
+        lat_hist[:, 0], lon_hist[:, 0], anchor_lat, anchor_lon
+    )
+    history_16h_net_km = haversine_km(
+        lat_hist[:, i16], lon_hist[:, i16], anchor_lat, anchor_lon
+    )
+    history_last_8h_net_km = haversine_km(
+        lat_hist[:, i8], lon_hist[:, i8], anchor_lat, anchor_lon
+    )
+    history_path_km = _track_path_length_km(lat_hist, lon_hist)
+    dist_from_anchor = haversine_km(
+        anchor_lat[:, np.newaxis],
+        anchor_lon[:, np.newaxis],
+        lat_hist,
+        lon_hist,
+    )
+    history_max_radius_km = dist_from_anchor.max(axis=1)
+
+    step_8h = _future_horizon_step(future_steps, 8.0)
+    step_12h = _future_horizon_step(future_steps, 12.0)
+    future_8h_net_km = haversine_km(
+        anchor_lat, anchor_lon, lat_fut[:, step_8h], lon_fut[:, step_8h]
+    )
+    future_12h_net_km = haversine_km(
+        anchor_lat, anchor_lon, lat_fut[:, step_12h], lon_fut[:, step_12h]
+    )
+
+    loop_ratio = np.where(
+        history_path_km > 10.0,
+        history_full_net_km / np.maximum(history_path_km, 1e-6),
+        1.0,
+    )
+    arrived_then_stopped = (history_full_net_km >= 20.0) & (history_last_8h_net_km < 3.0)
+
+    return pd.DataFrame(
+        {
+            "history_full_net_km": history_full_net_km,
+            "history_16h_net_km": history_16h_net_km,
+            "history_last_8h_net_km": history_last_8h_net_km,
+            "history_path_km": history_path_km,
+            "history_max_radius_km": history_max_radius_km,
+            "history_loop_ratio": loop_ratio,
+            "arrived_then_stopped": arrived_then_stopped,
+            "future_8h_net_km": future_8h_net_km,
+            "future_12h_net_km": future_12h_net_km,
+        }
+    )
+
+
+def smart_motion_window_mask(
+    metrics: pd.DataFrame,
+    config: SmartMotionFilterConfig,
+) -> np.ndarray:
+    """True = remove window (not suitable for trajectory forecasting)."""
+    remove = (
+        metrics["history_16h_net_km"] < config.min_history_16h_net_km
+    ) | (metrics["history_last_8h_net_km"] < config.min_history_last_8h_net_km)
+
+    big_loop = (
+        (metrics["history_path_km"] >= config.min_big_loop_path_km)
+        | (metrics["history_max_radius_km"] >= config.max_local_loop_radius_km)
+    )
+    local_loop = (
+        (metrics["history_path_km"] > config.min_path_for_loop_km)
+        & (metrics["history_loop_ratio"] < config.max_history_loop_ratio)
+        & ~big_loop
+    )
+    remove |= local_loop
+    return remove.to_numpy()
+
+
+def smart_motion_keep_mask(
+    metrics: pd.DataFrame,
+    config: SmartMotionFilterConfig,
+) -> np.ndarray:
+    if not config.enabled:
+        return np.ones(len(metrics), dtype=bool)
+    return ~smart_motion_window_mask(metrics, config)
+
     if lat.shape[1] < 2:
         return np.zeros(lat.shape[0], dtype=np.float64)
     seg = haversine_km(lat[:, :-1], lon[:, :-1], lat[:, 1:], lon[:, 1:])
@@ -284,10 +436,12 @@ def stationary_window_mask(
         radius_col = "history_max_radius_km"
         disp_col = "history_displacement_km"
         sog_col = "history_mean_sog_kn"
+        path_col = "history_path_length_km"
     else:
         radius_col = "max_radius_km"
         disp_col = "future_displacement_km"
         sog_col = "mean_sog_kn"
+        path_col = "path_length_km"
 
     confined = metrics[radius_col] <= config.max_confined_radius_km
     short_motion = metrics[disp_col] < config.min_displacement_km
@@ -296,8 +450,34 @@ def stationary_window_mask(
     if sog_col in metrics.columns and np.isfinite(metrics[sog_col]).any():
         slow = metrics[sog_col] < config.min_mean_sog_kn
         secondary = slow & short_motion & confined
-        return (primary | secondary).to_numpy()
-    return primary.to_numpy()
+        remove = (primary | secondary).to_numpy()
+    else:
+        remove = primary.to_numpy()
+
+    if config.require_min_history_displacement_km > 0 and disp_col in metrics.columns:
+        remove |= (
+            metrics[disp_col] < config.require_min_history_displacement_km
+        ).to_numpy()
+
+    if config.require_min_history_path_km > 0 and path_col in metrics.columns:
+        remove |= (
+            metrics[path_col] < config.require_min_history_path_km
+        ).to_numpy()
+
+    if (
+        config.max_history_loop_ratio is not None
+        and path_col in metrics.columns
+        and disp_col in metrics.columns
+    ):
+        path = metrics[path_col].to_numpy(dtype=np.float64)
+        net = metrics[disp_col].to_numpy(dtype=np.float64)
+        loop_ratio = np.where(path > config.min_path_for_loop_km, net / np.maximum(path, 1e-6), 1.0)
+        remove |= (
+            (path > config.min_path_for_loop_km)
+            & (loop_ratio < config.max_history_loop_ratio)
+        )
+
+    return remove
 
 
 def filter_stationary_windows(
@@ -345,6 +525,15 @@ def print_stationary_filter_stats(stats: dict[str, float], config: StationaryFil
         f"disp<{config.min_displacement_km:.2f} km "
         f"(SOG<{config.min_mean_sog_kn:.1f} kn reinforces)"
     )
+    if config.require_min_history_displacement_km > 0:
+        print(f"  + require history net displacement ≥ {config.require_min_history_displacement_km:.1f} km")
+    if config.require_min_history_path_km > 0:
+        print(f"  + require history path length ≥ {config.require_min_history_path_km:.1f} km")
+    if config.max_history_loop_ratio is not None:
+        print(
+            f"  + drop history loops with net/path < {config.max_history_loop_ratio:.2f} "
+            f"(when path > {config.min_path_for_loop_km:.1f} km)"
+        )
     print(
         f"  removed {int(stats['windows_removed']):,} / {int(stats['windows_total']):,} "
         f"({stats['removed_fraction'] * 100:.1f}%) | "
@@ -381,6 +570,30 @@ def add_stationary_filter_args(parser) -> None:
         default=0.5,
         help="Mean SOG below this reinforces stationary removal (default: 0.5 kn).",
     )
+    parser.add_argument(
+        "--require-min-history-displacement-km",
+        type=float,
+        default=0.0,
+        help="Drop windows whose 24h history net displacement is below this (history-only, no label leak).",
+    )
+    parser.add_argument(
+        "--require-min-history-path-km",
+        type=float,
+        default=0.0,
+        help="Drop windows whose 24h history path length is below this.",
+    )
+    parser.add_argument(
+        "--max-history-loop-ratio",
+        type=float,
+        default=None,
+        help="Drop history loops where net/path is below this (e.g. 0.35 for ferries).",
+    )
+    parser.add_argument(
+        "--min-path-for-loop-km",
+        type=float,
+        default=10.0,
+        help="Only apply loop-ratio filter when history path exceeds this (default: 10 km).",
+    )
 
 
 def stationary_filter_from_args(args) -> StationaryFilterConfig:
@@ -394,6 +607,12 @@ def stationary_filter_from_args(args) -> StationaryFilterConfig:
             getattr(args, "min_displacement_km", 1.0),
         ),
         min_mean_sog_kn=getattr(args, "min_mean_sog_kn", 0.5),
+        require_min_history_displacement_km=getattr(
+            args, "require_min_history_displacement_km", 0.0
+        ),
+        require_min_history_path_km=getattr(args, "require_min_history_path_km", 0.0),
+        max_history_loop_ratio=getattr(args, "max_history_loop_ratio", None),
+        min_path_for_loop_km=getattr(args, "min_path_for_loop_km", 10.0),
     )
 
 
@@ -539,7 +758,17 @@ def motion_stratified_sample(
         pick(masks["straight"], n_straight),
         pick(masks["other"], n_other),
     ]
-    chosen = np.unique(np.concatenate([p for p in parts if len(p)]))
+    nonempty = [p for p in parts if len(p)]
+    if not nonempty:
+        # Prefetch row-groups / aggressive stationary filter can leave zero
+        # straight/other rows. Fall back to uniform random sampling.
+        print(
+            "Motion-stratified sample: no straight/other rows available — "
+            "falling back to uniform sample"
+        )
+        return df.sample(sample_size, random_state=seed).reset_index(drop=True)
+
+    chosen = np.unique(np.concatenate(nonempty))
     if len(chosen) < sample_size:
         pool = np.setdiff1d(np.arange(len(df)), chosen)
         need = sample_size - len(chosen)
@@ -786,26 +1015,81 @@ def infer_window_shape(df: pd.DataFrame) -> tuple[int, int]:
     return history_steps, future_steps
 
 
+def hours_to_window_steps(hours: float, step_minutes: float = 10.0) -> int:
+    return max(1, int(round(hours * 60 / step_minutes)))
+
+
+def resolve_window_hours(
+    df: pd.DataFrame,
+    *,
+    history_hours: float | None = None,
+    future_hours: float | None = None,
+    step_minutes: float | None = None,
+) -> tuple[int, int, int, int, float]:
+    """Map hour targets to step counts against parquet window columns.
+
+    Returns (full_history_steps, full_future_steps, use_history_steps, use_future_steps, step_minutes).
+    History is always taken as the suffix ending at the anchor (last full-history step).
+    Future is always taken as the prefix from forecast start.
+    """
+    full_h, full_f = infer_window_shape(df)
+    if step_minutes is None:
+        step_minutes = (
+            float(df["resample_minutes"].iloc[0])
+            if "resample_minutes" in df.columns
+            else 10.0
+        )
+    use_h = (
+        hours_to_window_steps(history_hours, step_minutes)
+        if history_hours is not None
+        else full_h
+    )
+    use_f = (
+        hours_to_window_steps(future_hours, step_minutes)
+        if future_hours is not None
+        else full_f
+    )
+    if use_h > full_h:
+        raise ValueError(
+            f"history_hours={history_hours} needs {use_h} steps but parquet has {full_h}"
+        )
+    if use_f > full_f:
+        raise ValueError(
+            f"future_hours={future_hours} needs {use_f} steps but parquet has {full_f}"
+        )
+    return full_h, full_f, use_h, use_f, step_minutes
+
+
 def build_window_arrays(
     df: pd.DataFrame,
     feature_cols: list[str] | None = None,
     history_steps: int | None = None,
     future_steps: int | None = None,
+    full_history_steps: int | None = None,
+    target_mode: str = "anchor_offset",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     feature_cols = feature_cols or infer_feature_cols(df)
-    if history_steps is None or future_steps is None:
-        history_steps, future_steps = infer_window_shape(df)
+    full_h, full_f = infer_window_shape(df)
+    if full_history_steps is not None:
+        full_h = full_history_steps
+    if history_steps is None:
+        history_steps = full_h
+    if future_steps is None:
+        future_steps = full_f
+    if history_steps > full_h:
+        raise ValueError(f"history_steps={history_steps} exceeds parquet history {full_h}")
+    if future_steps > full_f:
+        raise ValueError(f"future_steps={future_steps} exceeds parquet future {full_f}")
 
     n_samples = len(df)
     n_features = len(feature_cols)
     x = np.empty((n_samples, history_steps, n_features), dtype=np.float32)
     y = np.empty((n_samples, future_steps, 2), dtype=np.float32)
 
-    # Read all features for one timestep at a time — 144 block reads vs 2160
-    # individual column reads.  Each block is (n_samples, 15) which is small
-    # enough to stay in cache and avoids repeated pandas overhead.
+    h_start = full_h - history_steps
     for t in range(history_steps):
-        cols = [f"x_t{t:03d}_{col}" for col in feature_cols]
+        src_t = h_start + t
+        cols = [f"x_t{src_t:03d}_{col}" for col in feature_cols]
         x[:, t, :] = df[cols].to_numpy(dtype=np.float32)
 
     for t in range(future_steps):
@@ -813,8 +1097,208 @@ def build_window_arrays(
         y[:, t, 1] = df[f"y_t{t:03d}_lon"].to_numpy(dtype=np.float32)
 
     anchor = x[:, -1, :2].copy()
-    y_delta = y - anchor[:, np.newaxis, :]
+    y_delta = build_targets(y, anchor, target_mode=target_mode)
     return x, y, y_delta, anchor
+
+
+def build_targets(
+    y_abs: np.ndarray,
+    anchor: np.ndarray,
+    *,
+    target_mode: str = "anchor_offset",
+) -> np.ndarray:
+    """Future targets: anchor-offset (P_t - P_0) or step-delta (P_t - P_{t-1})."""
+    if target_mode == "anchor_offset":
+        return (y_abs - anchor[:, np.newaxis, :]).astype(np.float32)
+    if target_mode == "step_delta":
+        return absolute_to_step_delta(y_abs, anchor)
+    raise ValueError(f"target_mode must be 'anchor_offset' or 'step_delta', got {target_mode!r}")
+
+
+def absolute_to_step_delta(y_abs: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+    """Local step displacements d_t = P_t - P_{t-1}; d_0 = P_0 - anchor."""
+    step = np.empty_like(y_abs, dtype=np.float32)
+    step[:, 0, :] = y_abs[:, 0, :] - anchor
+    if y_abs.shape[1] > 1:
+        step[:, 1:, :] = y_abs[:, 1:, :] - y_abs[:, :-1, :]
+    return step
+
+
+def step_delta_to_anchor_offset(step_delta: np.ndarray) -> np.ndarray:
+    """Cumulative sum of step-deltas → offsets from anchor."""
+    return np.cumsum(step_delta, axis=1).astype(np.float32)
+
+
+def deltas_to_absolute(
+    deltas: np.ndarray,
+    anchor: np.ndarray,
+    *,
+    target_mode: str = "anchor_offset",
+) -> np.ndarray:
+    if target_mode == "step_delta":
+        return anchor[:, np.newaxis, :] + np.cumsum(deltas, axis=1)
+    return anchor[:, np.newaxis, :] + deltas
+
+
+def cumulative_delta_to_step_delta(cumulative: np.ndarray) -> np.ndarray:
+    step = np.empty_like(cumulative)
+    step[:, 0, :] = cumulative[:, 0, :]
+    if cumulative.shape[1] > 1:
+        step[:, 1:, :] = cumulative[:, 1:, :] - cumulative[:, :-1, :]
+    return step.astype(np.float32)
+
+
+def baseline_step_delta(
+    x: np.ndarray,
+    future_steps: int,
+    *,
+    kinematic: bool = False,
+    feature_cols: list[str] | None = None,
+    step_minutes: float = 10.0,
+) -> np.ndarray:
+    """Per-step naive/kinematic displacements for residual step-delta training."""
+    cumulative = baseline_cumulative_delta(
+        x,
+        future_steps,
+        kinematic=kinematic,
+        feature_cols=feature_cols,
+        step_minutes=step_minutes,
+    )
+    return cumulative_delta_to_step_delta(cumulative)
+
+
+def hour_steps_from_minutes(step_minutes: float, hours: float = 1.0) -> int:
+    return max(1, int(round(hours * 60 / step_minutes)))
+
+
+def one_hour_displacement_from_future(
+    y_abs: np.ndarray,
+    anchor: np.ndarray,
+    hour_step: int,
+) -> np.ndarray:
+    """Displacement P_{t+1h} - P_0 for each sample, shape (N, 2)."""
+    return (y_abs[:, hour_step, :] - anchor).astype(np.float32)
+
+
+def chunk_displacement_from_future(
+    y_abs: np.ndarray,
+    anchor: np.ndarray,
+    chunk_end_step: int,
+) -> np.ndarray:
+    """Displacement to chunk end step relative to anchor: P_{t+chunk} - P_0."""
+    return (y_abs[:, chunk_end_step, :] - anchor).astype(np.float32)
+
+
+def naive_one_hour_displacement(
+    x: np.ndarray,
+    hour_step: int,
+    *,
+    kinematic: bool = False,
+    feature_cols: list[str] | None = None,
+    step_minutes: float = 10.0,
+) -> np.ndarray:
+    cumulative = baseline_cumulative_delta(
+        x,
+        hour_step + 1,
+        kinematic=kinematic,
+        feature_cols=feature_cols,
+        step_minutes=step_minutes,
+    )
+    return cumulative[:, hour_step, :].astype(np.float32)
+
+
+def naive_chunk_displacement(
+    x: np.ndarray,
+    chunk_end_step: int,
+    *,
+    kinematic: bool = False,
+    feature_cols: list[str] | None = None,
+    step_minutes: float = 10.0,
+) -> np.ndarray:
+    return naive_one_hour_displacement(
+        x, chunk_end_step, kinematic=kinematic, feature_cols=feature_cols, step_minutes=step_minutes
+    )
+
+
+def append_synthetic_hour_to_history(
+    x: np.ndarray,
+    hour_displacement: np.ndarray,
+    *,
+    steps_per_hour: int,
+    step_minutes: float = 10.0,
+    feature_cols: list[str] | None = None,
+) -> np.ndarray:
+    """
+    Shift history window forward by one hour, appending synthetic AIS feature rows.
+
+    Used for recursive 1-hour sliding-window inference (Experiment E).
+    """
+    cols = feature_cols or FEATURE_COLS
+    lat_i = feature_index(cols, "lat")
+    lon_i = feature_index(cols, "lon")
+    sog_i = feature_index(cols, "sog")
+    cog_sin_i = feature_index(cols, "cog_sin")
+    cog_cos_i = feature_index(cols, "cog_cos")
+    heading_sin_i = feature_index(cols, "heading_sin")
+    heading_cos_i = feature_index(cols, "heading_cos")
+    heading_miss_i = feature_index(cols, "heading_missing")
+    dt_i = feature_index(cols, "dt_sec")
+    dlat_i = feature_index(cols, "dlat")
+    dlon_i = feature_index(cols, "dlon")
+    dsog_i = feature_index(cols, "dsog")
+    dcog_i = feature_index(cols, "dcog")
+    vn_i = feature_index(cols, "v_north_kmh")
+    ve_i = feature_index(cols, "v_east_kmh")
+
+    batch, total_steps, n_feat = x.shape
+    drop = min(steps_per_hour, total_steps)
+    keep = total_steps - drop
+    out = np.zeros((batch, total_steps, n_feat), dtype=np.float32)
+    out[:, :keep, :] = x[:, drop:, :]
+
+    last_lat = x[:, -1, lat_i].astype(np.float64)
+    last_lon = x[:, -1, lon_i].astype(np.float64)
+    dlat_total = hour_displacement[:, 0].astype(np.float64)
+    dlon_total = hour_displacement[:, 1].astype(np.float64)
+    dt_sec = step_minutes * 60.0
+
+    prev_lat = last_lat.copy()
+    prev_lon = last_lon.copy()
+    prev_sog = x[:, -1, sog_i].astype(np.float64)
+
+    for s in range(steps_per_hour):
+        frac = (s + 1) / steps_per_hour
+        lat = last_lat + dlat_total * frac
+        lon = last_lon + dlon_total * frac
+        dlat = lat - prev_lat
+        dlon = lon - prev_lon
+        dist_km = np.sqrt((dlat * 111.322) ** 2 + (dlon * 111.322 * np.cos(np.deg2rad(lat))) ** 2)
+        sog_kn = (dist_km / NM_TO_KM) / (step_minutes / 60.0)
+        cog_rad = np.arctan2(dlon * np.cos(np.deg2rad(lat)), dlat)
+        dsog = sog_kn - prev_sog
+
+        idx = keep + s
+        out[:, idx, lat_i] = lat.astype(np.float32)
+        out[:, idx, lon_i] = lon.astype(np.float32)
+        out[:, idx, sog_i] = sog_kn.astype(np.float32)
+        out[:, idx, cog_sin_i] = np.sin(cog_rad).astype(np.float32)
+        out[:, idx, cog_cos_i] = np.cos(cog_rad).astype(np.float32)
+        out[:, idx, heading_sin_i] = out[:, idx, cog_sin_i]
+        out[:, idx, heading_cos_i] = out[:, idx, cog_cos_i]
+        out[:, idx, heading_miss_i] = 0.0
+        out[:, idx, dt_i] = dt_sec
+        out[:, idx, dlat_i] = dlat.astype(np.float32)
+        out[:, idx, dlon_i] = dlon.astype(np.float32)
+        out[:, idx, dsog_i] = dsog.astype(np.float32)
+        out[:, idx, dcog_i] = 0.0
+        out[:, idx, vn_i] = (sog_kn * NM_TO_KM * np.cos(cog_rad)).astype(np.float32)
+        out[:, idx, ve_i] = (sog_kn * NM_TO_KM * np.sin(cog_rad)).astype(np.float32)
+
+        prev_lat = lat
+        prev_lon = lon
+        prev_sog = sog_kn
+
+    return out
 
 
 def scale_history_features(
@@ -833,6 +1317,16 @@ def scale_history_features(
         flat = arr.reshape(n * history_steps, n_features)
         scaled_other.append(scaler.transform(flat).reshape(n, history_steps, n_features))
     return x_train_scaled.astype(np.float32), [a.astype(np.float32) for a in scaled_other], scaler
+
+
+def split_column(df: pd.DataFrame, split_by: str) -> str:
+    if split_by == "mmsi":
+        if "mmsi" not in df.columns:
+            raise KeyError("split_by='mmsi' but column 'mmsi' is missing from windows frame")
+        return "mmsi"
+    if "traj_id" in df.columns:
+        return "traj_id"
+    raise KeyError("No trajectory id column found (expected 'traj_id')")
 
 
 def trajectory_splits(
@@ -1031,7 +1525,7 @@ def evaluate_final_position(
         "mae_lat": float(mean_absolute_error(y_true[:, 0], y_pred[:, 0])),
         "mae_lon": float(mean_absolute_error(y_true[:, 1], y_pred[:, 1])),
         "rmse_lat": float(np.sqrt(mean_squared_error(y_true[:, 0], y_pred[:, 0]))),
-        "rmse_lon": float(np.sqrt(mean_squared_error(y_true[:, 1], y_pred[:, 1])),
+        "rmse_lon": float(np.sqrt(mean_squared_error(y_true[:, 1], y_pred[:, 1]))),
         "r2_lat": float(r2_score(y_true[:, 0], y_pred[:, 0])),
         "r2_lon": float(r2_score(y_true[:, 1], y_pred[:, 1])),
         "mean_error_km": float(distance_km.mean()),

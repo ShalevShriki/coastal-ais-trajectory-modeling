@@ -688,10 +688,13 @@ def resample_one_trajectory(
     traj = traj.sort_values("timestamp").drop_duplicates("timestamp").copy()
     traj = traj.set_index("timestamp")
 
-    numeric_cols = [
+    # Deduplicate: TARGET_COLS (lat/lon) are already in WINDOW_FEATURE_COLS.
+    # Without this, pd.concat creates duplicate lat/lon columns and to_numpy()
+    # silently flattens / mis-aligns, corrupting windows (lon copied from lat).
+    numeric_cols = list(dict.fromkeys(
         col for col in WINDOW_FEATURE_COLS + TARGET_COLS
         if col in traj.columns
-    ]
+    ))
     meta_cols = [col for col in ["mmsi", "traj_id", "vessel_type"] if col in traj.columns]
 
     numeric = traj[numeric_cols].resample(f"{every_minutes}min").mean().interpolate(
@@ -716,21 +719,14 @@ def build_sequence_windows(
     lat_range: tuple[float, float] | None = None,
     lon_range: tuple[float, float] | None = None,
     max_gap_steps: int = 6,
-) -> pd.DataFrame:
-    """
-    Creates one row per supervised sample.
+    output_path: Path | None = None,
+    flush_rows: int = 20_000,
+) -> pd.DataFrame | int:
+    """Build fixed-length windows.
 
-    Each row contains:
-        X: flattened past sequence  (history_steps x n_features)
-        y: flattened future lat/lon (future_steps x 2)
-        plus metadata fields.
-
-    lat_range / lon_range: if provided, windows where any future position exits
-    the geographic frame are skipped — the model never trains to predict outside
-    the area of interest.
-
-    max_gap_steps: passed to resample_one_trajectory to cap interpolation across
-    AIS gaps (default 6 steps = 1 hour at 10-min grid).
+    If ``output_path`` is given, windows are streamed to parquet in batches and
+    the total sample count (int) is returned. This keeps peak memory bounded for
+    very large coasts. Otherwise the full DataFrame is returned (legacy behavior).
     """
     start = time.perf_counter()
     print("\nBuilding fixed-length sequence windows...", flush=True)
@@ -742,11 +738,36 @@ def build_sequence_windows(
     if history_steps <= 0 or future_steps <= 0:
         raise ValueError("history_steps and future_steps must be positive.")
 
-    rows = []
+    streaming = output_path is not None
+    rows: list[dict] = []
     rng = np.random.default_rng(42)
 
-    grouped = list(segmented_df.groupby("traj_id", sort=False))
-    total_traj = len(grouped)
+    writer: pq.ParquetWriter | None = None
+    schema_columns: list[str] | None = None
+    total_written = 0
+
+    def flush_batch(force: bool = False) -> None:
+        nonlocal writer, schema_columns, total_written, rows
+        if not rows:
+            return
+        if not force and len(rows) < flush_rows:
+            return
+        batch_df = pd.DataFrame(rows)
+        if schema_columns is None:
+            schema_columns = list(batch_df.columns)
+        else:
+            batch_df = batch_df.reindex(columns=schema_columns)
+        table = pa.Table.from_pandas(batch_df, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+        else:
+            table = table.cast(writer.schema)
+        writer.write_table(table)
+        total_written += len(rows)
+        rows = []
+
+    grouped = segmented_df.groupby("traj_id", sort=False)
+    total_traj = segmented_df["traj_id"].nunique()
 
     for idx, (traj_id, traj) in enumerate(grouped, start=1):
         regular = resample_one_trajectory(traj, resample_minutes, max_gap_steps=max_gap_steps)
@@ -796,14 +817,37 @@ def build_sequence_windows(
 
             rows.append(row)
 
+        if streaming:
+            flush_batch()
+
         if idx == 1 or idx == total_traj or idx % 50 == 0:
+            seen = total_written + len(rows)
             print(
-                f"\rWindows: trajectories {idx:,}/{total_traj:,} | rows {len(rows):,}",
+                f"\rWindows: trajectories {idx:,}/{total_traj:,} | rows {seen:,}",
                 end="",
                 flush=True,
             )
 
     print()
+
+    if streaming:
+        flush_batch(force=True)
+        if writer is not None:
+            writer.close()
+        if total_written == 0:
+            raise ValueError(
+                "No sequence windows could be created. "
+                "Use smaller --history-hours/--future-hours, smaller --resample-minutes, "
+                "or keep longer segments."
+            )
+        print(
+            f"Window build done (streamed): {total_written:,} samples | "
+            f"history_steps={history_steps}, future_steps={future_steps}, "
+            f"runtime {format_duration(time.perf_counter() - start)}",
+            flush=True,
+        )
+        return total_written
+
     if not rows:
         raise ValueError(
             "No sequence windows could be created. "
@@ -848,7 +892,7 @@ def save_summary(
     lon_range: tuple[float, float],
     segmented_df: pd.DataFrame,
     seg_stats: pd.DataFrame,
-    windows: pd.DataFrame | None,
+    window_count: int | None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "processing_summary.txt"
@@ -876,9 +920,9 @@ def save_summary(
         "",
     ]
 
-    if windows is not None:
+    if window_count is not None:
         lines += [
-            f"window samples: {len(windows):,}",
+            f"window samples: {window_count:,}",
             f"history_hours: {args.history_hours}",
             f"future_hours: {args.future_hours}",
             f"resample_minutes: {args.resample_minutes}",
@@ -938,18 +982,18 @@ def finalize_coastal_pipeline(
     print(f"Saved segments: {segments_path}", flush=True)
     print(f"Saved stats:    {stats_path}", flush=True)
 
-    windows = None
+    window_count: int | None = None
     if not no_windows:
-        print("Building long-horizon model windows...", flush=True)
-        windows = build_sequence_windows(
+        print("Building long-horizon model windows (streaming)...", flush=True)
+        windows_path = output_dir / "model_ready_windows.parquet"
+        window_count = build_sequence_windows(
             segmented_df,
             history_hours=history_hours,
             future_hours=future_hours,
             resample_minutes=resample_minutes,
             max_windows_per_traj=max_windows_per_traj,
+            output_path=windows_path,
         )
-        windows_path = output_dir / "model_ready_windows.parquet"
-        windows.to_parquet(windows_path, index=False)
         print(f"Saved model windows: {windows_path}", flush=True)
         final_path = windows_path
     else:
@@ -963,7 +1007,7 @@ def finalize_coastal_pipeline(
             lon_range=lon_range,
             segmented_df=segmented_df,
             seg_stats=seg_stats,
-            windows=windows,
+            window_count=window_count,
         )
 
     return final_path

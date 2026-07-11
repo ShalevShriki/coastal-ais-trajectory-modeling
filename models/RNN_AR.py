@@ -13,13 +13,15 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 from proj.project.coast_paths import COAST_CONFIGS, models_output_dir, resolve_windows_path, results_output_dir
 from proj.project.window_data import (
     FEATURE_COLS,
     baseline_cumulative_delta,
+    baseline_step_delta,
     build_window_arrays,
+    deltas_to_absolute,
     compute_sample_weights,
     evaluate_final_position,
     evaluate_full_trajectory,
@@ -27,6 +29,7 @@ from proj.project.window_data import (
     haversine_km,
     horizon_step_index,
     infer_window_shape,
+    resolve_window_hours,
     kinematic_position_at_horizon,
     load_windows_filtered,
     add_stationary_filter_args,
@@ -37,12 +40,14 @@ from proj.project.window_data import (
     scale_history_features,
     window_horizon_hours,
 )
+from proj.project.models.plot_utils import save_training_history_plot
 from proj.project.models.training_utils import (
     TrajectoryLoss,
     TrainingImprovementConfig,
     add_training_improvement_args,
     apply_residual_prediction,
     curriculum_train_steps,
+    enrich_history_row,
     scheduled_teacher_forcing,
     training_config_from_args,
     training_improvements_dict,
@@ -321,6 +326,7 @@ def predict_absolute_positions(
     device: torch.device,
     *,
     residual_naive: bool = False,
+    target_mode: str = "anchor_offset",
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
 
@@ -336,13 +342,16 @@ def predict_absolute_positions(
         y_hat_delta = apply_residual_prediction(
             y_hat_delta, batch_naive, residual=residual_naive
         )
-
-        y_hat_delta = y_hat_delta.cpu().numpy()
-        y_true_delta = batch_y_delta.cpu().numpy()
-        anchor = batch_anchor.cpu().numpy()[:, np.newaxis, :]
-
-        y_true_abs = anchor + y_true_delta
-        y_pred_abs = anchor + y_hat_delta
+        y_true_abs = deltas_to_absolute(
+            batch_y_delta.cpu().numpy(),
+            batch_anchor.cpu().numpy(),
+            target_mode=target_mode,
+        )
+        y_pred_abs = deltas_to_absolute(
+            y_hat_delta.cpu().numpy(),
+            batch_anchor.cpu().numpy(),
+            target_mode=target_mode,
+        )
 
         y_true_list.append(y_true_abs)
         y_pred_list.append(y_pred_abs)
@@ -353,26 +362,6 @@ def predict_absolute_positions(
 # ---------------------------------------------------------------------------
 # Metrics and plots
 # ---------------------------------------------------------------------------
-
-def save_training_plot(history: list[dict[str, float]], output_path: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    epochs = [row["epoch"] for row in history]
-    train_loss = [row["train_loss"] for row in history]
-    val_loss = [row["val_loss"] for row in history]
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, train_loss, label="Train loss")
-    ax.plot(epochs, val_loss, label="Validation loss")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Huber loss")
-    ax.set_title("AR-RNN Training History")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.35)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    plt.close(fig)
-
 
 def save_error_histogram(
     y_true_final: np.ndarray,
@@ -461,9 +450,16 @@ def run_rnn_ar(
     sample_size: int | None,
     horizon_hours: float,
     teacher_forcing_ratio: float,
+    history_hours: float | None = None,
+    future_hours: float | None = None,
     motion_filter=None,
     training_config: TrainingImprovementConfig | None = None,
+    run_tag: str | None = None,
+    target_mode: str = "anchor_offset",
 ) -> Path:
+    if target_mode not in ("anchor_offset", "step_delta"):
+        raise ValueError(f"target_mode must be 'anchor_offset' or 'step_delta', got {target_mode!r}")
+
     training_config = training_config or TrainingImprovementConfig()
     start_time = time.perf_counter()
 
@@ -497,17 +493,20 @@ def run_rnn_ar(
     )
 
     tag = f"RNN_AR_{rnn_type.upper()}"
-    output_dir = results_output_dir(coast, input_path, tag, df)
-    model_dir = models_output_dir(coast, input_path, df)
+    output_dir = results_output_dir(coast, input_path, tag, df, run_tag=run_tag)
+    model_dir = models_output_dir(coast, input_path, df, run_tag=run_tag)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    history_steps, future_steps = infer_window_shape(df)
-    window_hours = window_horizon_hours(df, future_steps)
-    horizon_step = horizon_step_index(df, horizon_hours, future_steps)
-    step_minutes = (
-        float(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10.0
+    full_history_steps, full_future_steps, history_steps, future_steps, step_minutes = (
+        resolve_window_hours(
+            df,
+            history_hours=history_hours,
+            future_hours=future_hours,
+        )
     )
+    window_hours = future_steps * step_minutes / 60
+    horizon_step = horizon_step_index(df, horizon_hours, future_steps)
     actual_horizon_hours = (
         (horizon_step + 1) * step_minutes / 60
         if "resample_minutes" in df.columns
@@ -529,19 +528,38 @@ def run_rnn_ar(
     )
 
     x_train, y_abs_train, y_delta_train, anchor_train = build_window_arrays(
-        train_df, history_steps=history_steps, future_steps=future_steps
+        train_df,
+        history_steps=history_steps,
+        future_steps=future_steps,
+        full_history_steps=full_history_steps,
+        target_mode=target_mode,
     )
     x_val, _, y_delta_val, anchor_val = build_window_arrays(
-        val_df, history_steps=history_steps, future_steps=future_steps
+        val_df,
+        history_steps=history_steps,
+        future_steps=future_steps,
+        full_history_steps=full_history_steps,
+        target_mode=target_mode,
     )
     x_test, y_test_abs, y_delta_test, anchor_test = build_window_arrays(
-        test_df, history_steps=history_steps, future_steps=future_steps
+        test_df,
+        history_steps=history_steps,
+        future_steps=future_steps,
+        full_history_steps=full_history_steps,
+        target_mode=target_mode,
     )
 
     use_kinematic = training_config.kinematic_baseline
     naive_for_dataset = training_config.residual_naive
 
     def _baseline_delta(x_arr: np.ndarray) -> np.ndarray:
+        if target_mode == "step_delta":
+            return baseline_step_delta(
+                x_arr,
+                future_steps,
+                kinematic=use_kinematic,
+                step_minutes=step_minutes,
+            )
         return baseline_cumulative_delta(
             x_arr,
             future_steps,
@@ -565,9 +583,9 @@ def run_rnn_ar(
     print(f"Samples loaded: {len(df):,}")
     print(f"Unique {split_label}: {num_entities:,} (split by {training_config.split_by})")
     print(
-        f"Window: history={history_steps} steps | "
-        f"future={future_steps} steps | "
-        f"window={window_hours:.1f} h | "
+        f"Window: history={history_steps} steps ({history_steps * step_minutes / 60:.1f}h"
+        f" of {full_history_steps}) | "
+        f"future={future_steps} steps ({window_hours:.1f}h) | "
         f"eval horizon={actual_horizon_hours:.1f} h (step {horizon_step + 1}/{future_steps})"
     )
     print(f"Features: {FEATURE_COLS}")
@@ -621,6 +639,21 @@ def run_rnn_ar(
         num_workers=0,
     )
 
+    train_eval_size = min(len(train_dataset), max(len(val_dataset), 10_000))
+    train_eval_idx = np.random.default_rng(seed).choice(
+        len(train_dataset), size=train_eval_size, replace=False
+    )
+    # Unweighted eval — same protocol as validation (no difficulty weights).
+    train_eval_dataset = WindowDataset(
+        x_train, y_delta_train, anchor_train, None, naive_train
+    )
+    train_eval_loader = DataLoader(
+        Subset(train_eval_dataset, train_eval_idx.tolist()),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
     # -----------------------------------------------------------------------
     # Model, loss, optimizer
     # -----------------------------------------------------------------------
@@ -638,6 +671,7 @@ def run_rnn_ar(
         haversine_weight=training_config.haversine_weight,
         relative_weight=training_config.relative_loss_weight,
         min_path_km=training_config.min_path_km,
+        target_mode=target_mode,
     )
     resample_minutes = (
         int(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10
@@ -647,6 +681,7 @@ def run_rnn_ar(
         f"Loss: Huber + Haversine (w={training_config.haversine_weight:.2f}) | "
         f"TF start={base_tf:.2f} scheduled={'on' if training_config.scheduled_teacher_forcing else 'off'} | "
         f"residual naive={'on' if training_config.residual_naive else 'off'} | "
+        f"target={target_mode} | "
         f"motion sample={'balanced' if training_config.motion_balanced_sample else 'uniform'}"
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -721,6 +756,13 @@ def run_rnn_ar(
             device=device,
             residual_naive=training_config.residual_naive,
         )
+        train_eval_loss = evaluate_loss(
+            model=model,
+            dataloader=train_eval_loader,
+            criterion=criterion,
+            device=device,
+            residual_naive=training_config.residual_naive,
+        )
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -728,13 +770,17 @@ def run_rnn_ar(
         total_train_time += epoch_elapsed
 
         history.append(
-            {
-                "epoch": epoch,
-                "train_loss": float(train_loss),
-                "val_loss": float(val_loss),
-                "lr": current_lr,
-                "epoch_sec": float(epoch_elapsed),
-            }
+            enrich_history_row(
+                epoch=epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                lr=current_lr,
+                epoch_sec=epoch_elapsed,
+                train_steps=train_steps_cur if training_config.curriculum else future_steps,
+                future_steps=future_steps,
+                teacher_forcing=epoch_tf,
+                train_eval_loss=train_eval_loss,
+            )
         )
 
         print(
@@ -742,6 +788,7 @@ def run_rnn_ar(
             f"time: {epoch_elapsed:6.2f}s | "
             f"train loss {train_loss:10.6f} | "
             f"valid loss {val_loss:10.6f} | "
+            f"train eval {train_eval_loss:10.6f} | "
             f"lr {current_lr:.2e} | tf {epoch_tf:.2f}"
             + (
                 f" | train steps {train_steps_cur}/{future_steps}"
@@ -780,6 +827,16 @@ def run_rnn_ar(
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    best_epoch = int(min(history, key=lambda row: row["val_loss"])["epoch"])
+    test_loss_at_best = evaluate_loss(
+        model=model,
+        dataloader=test_loader,
+        criterion=criterion,
+        device=device,
+        residual_naive=training_config.residual_naive,
+    )
+    print(f"Test loss @ best epoch {best_epoch}: {test_loss_at_best:.6f}")
+
     # -----------------------------------------------------------------------
     # Test evaluation
     # -----------------------------------------------------------------------
@@ -789,6 +846,7 @@ def run_rnn_ar(
         dataloader=test_loader,
         device=device,
         residual_naive=training_config.residual_naive,
+        target_mode=target_mode,
     )
 
     # Save sample trajectories for map visualisation in the comparison script.
@@ -885,6 +943,7 @@ def run_rnn_ar(
             "num_layers": num_layers,
             "dropout": dropout,
             "model_variant": "autoregressive",
+            "target_mode": target_mode,
         },
         model_path,
     )
@@ -893,6 +952,8 @@ def run_rnn_ar(
         "input": str(input_path),
         "coast": coast.name,
         "days_label": output_dir.parent.name,
+        "run_tag": run_tag,
+        "experiment_id": run_tag.split("/")[-1] if run_tag else None,
         "region": region,
         "samples_total": int(len(df)),
         "samples_train": int(len(train_df)),
@@ -906,6 +967,7 @@ def run_rnn_ar(
         "horizon_hours_requested": float(horizon_hours),
         "horizon_hours_actual": float(actual_horizon_hours),
         "horizon_step_index": int(horizon_step),
+        "target_mode": target_mode,
         "architecture": {
             "type": rnn_type,
             "variant": "autoregressive",
@@ -937,15 +999,31 @@ def run_rnn_ar(
         },
         "metrics": metrics,
         "history": history,
+        "eval_summary": {
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
+            "test_loss_at_best": float(test_loss_at_best),
+        },
         "runtime_sec": round(time.perf_counter() - start_time, 2),
     }
 
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    save_training_plot(
+    save_training_history_plot(
         history,
         output_dir / f"{rnn_type}_ar_training_history.png",
+        title=f"{rnn_type.upper()}-AR Training History",
+        loss_label="Huber + Haversine loss",
+        autoregressive=True,
+        future_steps=future_steps,
+        resample_minutes=resample_minutes,
+        curriculum_start_hours=training_config.curriculum_start_hours,
+        curriculum_enabled=training_config.curriculum,
+        teacher_forcing_start=base_tf,
+        use_scheduled_teacher_forcing=training_config.scheduled_teacher_forcing,
+        test_loss_at_best=test_loss_at_best,
+        test_epoch=best_epoch,
     )
 
     save_error_histogram(
@@ -1038,12 +1116,39 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--history-hours",
+        type=float,
+        default=None,
+        help="Use last N hours of history (suffix ending at anchor). Default: full parquet history.",
+    )
+
+    parser.add_argument(
+        "--future-hours",
+        type=float,
+        default=None,
+        help="Use first N hours of future for train/eval. Default: full parquet future.",
+    )
+
+    parser.add_argument(
         "--teacher-forcing",
         type=float,
         default=0.5,
         help="Probability of using ground-truth delta as decoder input during training (0=free-running, 1=always teacher).",
     )
 
+    parser.add_argument(
+        "--target-mode",
+        choices=("anchor_offset", "step_delta"),
+        default="anchor_offset",
+        help="Future target parameterization for AR decoder (Experiment C vs D).",
+    )
+
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default=None,
+        help="Optional subdirectory under results/models (e.g. experiment1/v1_baseline).",
+    )
     add_stationary_filter_args(parser)
     add_training_improvement_args(parser)
 
@@ -1075,8 +1180,12 @@ def main() -> None:
         sample_size=None if args.sample <= 0 else args.sample,
         horizon_hours=args.horizon_hours,
         teacher_forcing_ratio=args.teacher_forcing,
+        history_hours=args.history_hours,
+        future_hours=args.future_hours,
         motion_filter=stationary_filter_from_args(args),
         training_config=training_config_from_args(args),
+        run_tag=args.run_tag,
+        target_mode=args.target_mode,
     )
 
 
