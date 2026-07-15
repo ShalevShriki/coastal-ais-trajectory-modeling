@@ -36,7 +36,7 @@ def main() -> None:
         "--alpha-json",
         type=Path,
         default=PROJECT
-        / "data/results/USA Combined/unknown/exp_final/adaptive_multiscale/RNN_AR_adaptive/context_alpha_weights.json",
+        / "data/results/USA Combined/unknown/exp_coastal/adaptive_multiscale/RNN_AR_adaptive/context_alpha_weights.json",
     )
     parser.add_argument("--sample", type=int, default=400_000)
     parser.add_argument("--seed", type=int, default=42)
@@ -47,7 +47,9 @@ def main() -> None:
     labels = ["9h", "12h", "18h", "24h"]
 
     input_path, _, _ = resolve_windows_path(
-        "USA Combined", "usa_combined", PROJECT / "data/processed/combined_filtered_smart/train.parquet"
+        "USA Combined",
+        "usa_combined",
+        PROJECT / "data/processed/combined_filtered_smart_coastal/train.parquet",
     )
     prefetch = int(args.sample / 0.7) + 1000
     df = load_windows_filtered(input_path, sample_size=prefetch, seed=args.seed)

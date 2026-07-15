@@ -226,12 +226,12 @@ def main() -> None:
         "--alpha-json",
         type=Path,
         default=PROJECT
-        / "data/results/USA Combined/unknown/exp_final/adaptive_vessel_type/RNN_AR_adaptive/context_alpha_weights.json",
+        / "data/results/USA Combined/unknown/exp_coastal/adaptive_multiscale/RNN_AR_adaptive/context_alpha_weights.json",
     )
     parser.add_argument(
         "--input",
         type=Path,
-        default=PROJECT / "data/processed/combined_filtered_smart/train.parquet",
+        default=PROJECT / "data/processed/combined_filtered_smart_coastal/train.parquet",
     )
     parser.add_argument("--sample", type=int, default=400_000)
     parser.add_argument("--seed", type=int, default=42)
@@ -240,7 +240,7 @@ def main() -> None:
         "--html",
         type=Path,
         default=PROJECT
-        / "data/results/USA Combined/unknown/exp_final/adaptive_vessel_type/RNN_AR_adaptive/gate_feature_drivers.html",
+        / "data/results/USA Combined/unknown/exp_coastal/adaptive_multiscale/RNN_AR_adaptive/gate_feature_drivers.html",
     )
     args = parser.parse_args()
 

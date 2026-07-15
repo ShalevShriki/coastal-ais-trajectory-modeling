@@ -53,6 +53,7 @@ class TrajectoryLoss(nn.Module):
 
     Supports curriculum via set_train_steps() and per-sample difficulty weights.
     Optional relative term: ADE / true path length (clamped) for scale-invariant training.
+    Optional soft land penalty via bilinear sampling of a coarse land raster.
     """
 
     def __init__(
@@ -62,6 +63,7 @@ class TrajectoryLoss(nn.Module):
         relative_weight: float = 0.0,
         min_path_km: float = 10.0,
         target_mode: str = "anchor_offset",
+        land_penalty: torch.nn.Module | None = None,
     ):
         super().__init__()
         self.haversine_weight = float(haversine_weight)
@@ -69,6 +71,7 @@ class TrajectoryLoss(nn.Module):
         self.min_path_km = float(min_path_km)
         self.target_mode = str(target_mode)
         self.huber = nn.HuberLoss(delta=huber_delta, reduction="none")
+        self.land_penalty = land_penalty
         self.train_steps: int | None = None
 
     def set_train_steps(self, steps: int | None) -> None:
@@ -117,7 +120,10 @@ class TrajectoryLoss(nn.Module):
         if sample_weight is not None:
             loss = loss * sample_weight
 
-        return loss.mean()
+        total = loss.mean()
+        if self.land_penalty is not None:
+            total = total + self.land_penalty(pred_abs)
+        return total
 
 
 @dataclass
@@ -139,6 +145,23 @@ class TrainingImprovementConfig:
     scheduled_teacher_forcing: bool = True
     teacher_forcing_start: float = 0.3
     teacher_forcing_end: float = 0.0
+    land_penalty_weight: float = 0.0
+
+
+def make_land_penalty(weight: float, device: torch.device | None = None):
+    """Build SoftLandPenalty or None. Grid is cached under data/processed/."""
+    if weight is None or float(weight) <= 0:
+        return None
+    from pathlib import Path
+
+    from proj.project.models.land_mask_utils import SoftLandPenalty, build_or_load_land_grid
+
+    project = Path(__file__).resolve().parents[1]
+    grid = build_or_load_land_grid(project / "data/processed/land_grid_us.npz")
+    penalty = SoftLandPenalty(grid, weight=float(weight))
+    if device is not None:
+        penalty = penalty.to(device)
+    return penalty
 
 
 def apply_residual_prediction(
@@ -203,6 +226,7 @@ def training_improvements_dict(config: TrainingImprovementConfig) -> dict:
         "scheduled_teacher_forcing": config.scheduled_teacher_forcing,
         "teacher_forcing_start": config.teacher_forcing_start,
         "teacher_forcing_end": config.teacher_forcing_end,
+        "land_penalty_weight": config.land_penalty_weight,
     }
 
 
@@ -321,6 +345,12 @@ def add_training_improvement_args(parser) -> None:
         action="store_true",
         help="(AR only) Disable scheduled teacher forcing decay.",
     )
+    parser.add_argument(
+        "--land-penalty-weight",
+        type=float,
+        default=0.0,
+        help="Soft land-mask penalty weight on predicted absolute positions (0=off, try 0.05–0.2).",
+    )
 
 
 def enrich_history_row(
@@ -373,4 +403,5 @@ def training_config_from_args(args) -> TrainingImprovementConfig:
         curriculum=not getattr(args, "no_curriculum", False),
         curriculum_start_hours=getattr(args, "curriculum_start_hours", 6.0),
         scheduled_teacher_forcing=not getattr(args, "no_scheduled_tf", False),
+        land_penalty_weight=float(getattr(args, "land_penalty_weight", 0.0) or 0.0),
     )

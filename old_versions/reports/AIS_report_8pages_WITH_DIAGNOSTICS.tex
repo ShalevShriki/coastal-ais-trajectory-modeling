@@ -1,0 +1,264 @@
+% Full original draft + mentor diagnostics inserted as text only (no new plots).
+% This restores Haversine, loss detail, both result tables, full ethics, etc.
+% If slightly over 8 pages after compile: shrink Fig 6 or table font first.
+
+\maketitle
+\vspace{-0.9em}
+
+\begin{abstract}
+This project studies vessel trajectory prediction from Automatic Identification System (AIS) data as a sequence learning problem. Given a history of position, speed, and direction sampled every 10 minutes, we predict the vessel latitude and longitude for the next 12 hours. The focus is not on building a maritime application, but on a central question in deep learning: how much temporal context does a sequence model really need, and does a more complex architecture make better use of long history?
+
+We compare a constant-speed and constant-course kinematic baseline, fixed-context AR LSTM models with history windows of 9, 12, 18, and 24 hours, a Flat LSTM that predicts the entire future trajectory directly, a Transformer, a short-window rolling model, and an Adaptive Multi-Scale RNN that learns soft weights over several history lengths. Neural models reduce median final displacement error (FDE) from 102.5 km for the kinematic baseline to roughly 19--20 km. The best model is a 24-hour Flat LSTM, with median FDE of 18.80 km; the Transformer follows with 19.40 km. In the fixed AR LSTM sweep, 18 hours gives the best result, while 24 hours does not improve it. Controlled diagnostics show that useful AR context saturates near the recent past (about 12--15 hours): older history barely moves the final encoder state or the training gradients and can act as noise. The adaptive model does not outperform the simpler models: its gate almost always selects the 24-hour context by only a small soft margin, the nested context representations are nearly redundant, and the gate partly behaves as a geographic prior rather than a motion-based switch. Thus, long history is important, but useful adaptive history selection does not emerge automatically from simply adding a gate.
+\end{abstract}
+\vspace{-0.4em}
+
+\section{Introduction and Motivation}
+The Automatic Identification System (AIS) broadcasts vessel data such as geographic position, speed over ground, course over ground, heading, and time. These measurements form a temporal sequence, so vessel trajectory prediction is naturally a sequence modeling problem. In this project, we predict a full 12-hour trajectory: not only a nearby point, but a long sequence in which a small early error can accumulate into a large final displacement.
+
+From a deep learning perspective, this problem combines several core ideas studied in the course. RNN/LSTM models compress trajectory history into a hidden state; autoregressive prediction uses previous predictions to generate future ones; Transformer models replace recurrent memory with self-attention; and training choices such as loss design, regularization, teacher forcing, and curriculum learning affect stability and generalization. Therefore, the question is not only which model achieves the lowest error, but also what architectural and training choices teach us about learning long-range temporal dependencies.
+
+The central research question is: how much history is actually useful for predicting a vessel trajectory 12 hours ahead? We test whether 24 hours is always better than 18 or 12, whether a Transformer uses long context more effectively than an LSTM, and whether an adaptive model can learn by itself when to use short history and when to use long history.
+
+Previous work on AIS trajectory prediction can be divided into three main groups. First, kinematic and statistical methods such as dead reckoning, constant velocity, linear regression, Kalman Filter, and Extended Kalman Filter assume a relatively simple motion model and update the vessel state from position, speed, and direction measurements [1]. These methods are simple and interpretable, but struggle over long horizons when a vessel changes speed, turns, or operates in a complex coastal environment. Second, RNN/LSTM approaches, including sequence-to-sequence models with LSTM, GRU, or Bi-LSTM components, learn sequential dynamics from trajectory history and improve over simple baselines [2]. Third, attention, Transformer, and geographic models such as TrAISformer and GeoTrackNet emphasize long-range patterns and local geographic context [3,4]. Our work does not simply propose another predictor; instead, it performs a controlled study of history length while keeping the data, horizon, and evaluation metrics fixed, and compares fixed-context models with an adaptive model that tries to learn the mixture of history lengths.
+
+\section{Data and Window Construction}
+The data is based on public NOAA AIS files from the United States, processed and merged into the USA Combined collection. Each record contains at least geographic location, time, speed over ground (SOG), course over ground (COG), and sometimes heading. Since the original measurements are not uniformly spaced in time, trajectories were resampled to a fixed temporal resolution of $\Delta t=10$ minutes.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.82\linewidth]{\figpath/fig1_prediction_examples.jpg}
+\caption{Example predictions from the test set. The gray curve is the vessel history, the blue curve is the true future trajectory, the green dashed curve is the model prediction, and the red segment marks the final displacement error.}
+\label{fig:examples}
+\end{figure}
+
+Figure~\ref{fig:examples} illustrates why this task is not merely point regression: even when prediction begins at the same anchor point, a small deviation in speed or direction can become a large displacement after 12 hours. Therefore, we focus on trajectory metrics such as FDE and ADE rather than only instantaneous error.
+
+Each training example is a continuous window. We store up to 24 hours of history, i.e. $T_h=144$ steps, and predict 12 hours into the future, i.e. $T_f=72$ steps. For fixed-context experiments we take a suffix of the full history window: 9 hours are 54 steps, 12 hours are 72 steps, 18 hours are 108 steps, and 24 hours are 144 steps. In all cases, the anchor point is the last observed position before prediction begins, so all models start from the same time point.
+
+The feature vector at each step includes position, speed, sine and cosine encodings of course, heading encoding, position differences, speed differences, course differences, and north/east velocity. Using sine and cosine for angles avoids an artificial discontinuity between $359^\circ$ and $0^\circ$. Instead of predicting only absolute coordinates, the model predicts offsets from the anchor point:
+\[
+ y_t=P_t-P_0,\qquad \hat{P}_t=P_0+\hat{y}_t,\qquad t=0,\ldots,71.
+\]
+This reduces dependence on absolute location and helps the model focus on local motion.
+
+\subsection{Data Filtering}
+To focus on active coastal trajectories rather than trivial or irrelevant examples, we applied three filtering stages. First, a stationarity filter removed windows where the vessel barely moved during the history, according to small motion radius, low total displacement, and low mean speed. Second, a smart-motion filter kept windows with meaningful movement and removed abnormal loops or windows that did not represent continuous sailing. Third, inland removal eliminated rivers, canals, and internal areas that do not represent the coastal forecasting task. A window was removed if most of its history points were not near open water. After filtering, 363,014 windows remained out of 535,967, i.e. 67.7\% of the examples. The train/validation/test split was done by trajectory ID rather than by random rows, to avoid leakage between similar windows from the same voyage.
+
+\section{Prediction Target and Evaluation Metrics}
+The target is the vessel position over the next 12 hours at 10-minute resolution, so each example has $T_f=72$ future steps. Let the anchor point, the last known position before prediction, be $P_0=(\mathrm{lat}_0,\mathrm{lon}_0)$. Instead of predicting absolute position directly, the model predicts offsets from the anchor:
+\[
+ y_t=P_t-P_0,\qquad \hat{P}_t=P_0+\hat{y}_t,\qquad t=0,\ldots,T_f-1.
+\]
+Here $P_t=(\mathrm{lat}_t,\mathrm{lon}_t)$ is the true future position and $\hat{P}_t$ is the predicted position.
+
+The main distance measure is the geodesic distance between prediction and ground truth, computed with the Haversine formula in kilometers. If $P_1=(\phi_1,\lambda_1)$ and $P_2=(\phi_2,\lambda_2)$, where $\phi$ is latitude and $\lambda$ is longitude in radians, then
+\[
+\begin{array}{c}
+\Delta\phi=\phi_2-\phi_1,\qquad \Delta\lambda=\lambda_2-\lambda_1,\\[1.2mm]
+a=\sin^2\!\left(\dfrac{\Delta\phi}{2}\right)+\cos(\phi_1)\cos(\phi_2)\sin^2\!\left(\dfrac{\Delta\lambda}{2}\right),\\[1.2mm]
+d_{\mathrm{Hav}}(P_1,P_2)=2R\arcsin\!\left(\sqrt{a}\right),\qquad R\simeq6371\,\mathrm{km}.
+\end{array}
+\]
+Final Displacement Error (FDE) measures the error at the last prediction step:
+\[
+\mathrm{FDE}=d_{\mathrm{Hav}}\!\left(\hat{P}_{T_f-1},P_{T_f-1}\right).
+\]
+Average Displacement Error (ADE) measures the mean error along the predicted trajectory:
+\[
+\mathrm{ADE}=\frac{1}{T_f}\sum_{t=0}^{T_f-1}d_{\mathrm{Hav}}\!\left(\hat{P}_{t},P_t\right).
+\]
+The main ranking uses median FDE, not only the mean, because long-horizon trajectory errors are heavy-tailed: a few abnormal voyages can strongly increase the average. We also report mean FDE and median ADE to distinguish final-point accuracy from accuracy along the path.
+
+\subsection{Motion Buckets}
+For analysis only, we split the test set into motion buckets, mainly straight versus maneuver. The split was not used for training. The bucket features were computed from the observed history, not from the future trajectory, to avoid leakage. For each window we computed quantities such as straightness, course changes, and speed changes. Straightness is the ratio between direct displacement and total path length:
+\[
+\mathrm{straightness}=\frac{d_{\mathrm{direct}}}{L_{\mathrm{path}}}.
+\]
+Windows with high straightness and low COG changes were classified as straight. Windows with significant COG changes or high direction variability were classified as maneuver. Ambiguous windows were assigned to the other group and excluded from the direct straight-versus-maneuver comparison. This analysis tests whether the same history length is suitable for every type of vessel motion.
+
+\section{Models and Training Methods}
+This section describes the model families and training procedure. The comparison is designed to isolate three factors: history length, memory mechanism, and prediction mode -- direct or autoregressive.
+
+\subsection{Kinematic Baseline and Fixed-Context AR LSTM}
+The kinematic baseline continues the last observed SOG and COG for 12 hours. It is not a deep learning model, but it is essential: if a neural network cannot beat such extrapolation, its complexity is not justified. In practice, this baseline is weak over 12 hours because vessels change speed, turn, enter and leave routes, and are affected by coastal geography.
+
+The main model in the context-length experiment is an encoder-decoder LSTM. The encoder reads the history and produces a hidden state, and the decoder predicts position offsets step by step:
+\[
+ h_{\mathrm{enc}}=\mathrm{LSTM}_{\mathrm{enc}}(x_{1:T_h}),\qquad
+ \hat{y}_t=f_{\mathrm{dec}}(\hat{y}_{<t},h_{\mathrm{enc}}).
+\]
+We trained the same architecture with four history lengths: 9, 12, 18, and 24 hours. At test time the decoder runs freely, so each prediction becomes input to the next step without access to the true value.
+
+\subsection{Architecture Comparison}
+In addition to the fixed-context AR LSTM, we tested several architectures to separate history length, prediction mode, and memory mechanism. Table~\ref{tab:modelstats} summarizes the main model comparison on the full coastal test set.
+
+\begin{table}[!htbp]
+\centering
+\scriptsize
+\caption{Main model comparison on the full coastal test set. FDE and ADE are in kilometers. Bold values indicate the best observed result in the corresponding column.}
+\label{tab:modelstats}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcrrrr}
+\toprule
+\textbf{Model} & \textbf{Architecture} & \textbf{History} & \textbf{Params} & \textbf{Median FDE} & \textbf{Mean FDE} & \textbf{Median ADE} \\
+\midrule
+Kinematic & SOG + COG extrapolation & -- & -- & 102.48 & 152.45 & -- \\
+AR LSTM 9h & Encoder-decoder AR LSTM, 256 x 2 & 54 steps (9h) & 1,631,618 & 20.43 & 36.53 & 7.50 \\
+AR LSTM 12h & Encoder-decoder AR LSTM, 256 x 2 & 72 steps (12h) & 1,631,618 & 19.99 & 36.70 & 7.39 \\
+AR LSTM 18h & Encoder-decoder AR LSTM, 256 x 2 & 108 steps (18h) & 1,631,618 & 19.71 & 37.30 & \textbf{7.35} \\
+AR LSTM 24h & Encoder-decoder AR LSTM, 256 x 2 & 144 steps (24h) & 1,631,618 & 20.30 & 36.60 & 7.47 \\
+Flat LSTM & Direct 72-step LSTM, 256 x 2 & 144 steps (24h) & 908,688 & \textbf{18.80} & \textbf{35.26} & 7.72 \\
+Transformer & Encoder-only Transformer, 4 layers, 8 heads & 144 steps (24h) & $\sim$1,002,000 & 19.40 & 36.81 & 8.24 \\
+Sliding 3h x 4 & LSTM rolled forward four times & 144 steps to 3h x 4 & 839,042 & 22.44 & 39.35 & 7.61 \\
+Adaptive AR & Shared LSTM + gate over contexts & 9+12+18+24h & 1,895,046 & 20.19 & 36.70 & 7.64 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+The Flat LSTM reads 24 hours of history and predicts all 72 future points at once, avoiding autoregressive error accumulation. The Transformer uses self-attention over the long history to test whether explicit attention over all time steps is more useful than recurrent memory. The Sliding 3h x 4 model trains a short 3-hour predictor and rolls it four times to reach 12 hours. The Adaptive Multi-Scale RNN encodes 9, 12, 18, and 24 hour windows and combines them using a soft gate, testing whether the model can choose short or long context depending on the trajectory.
+
+\subsection{Loss Function and Training}
+It is important to distinguish evaluation metrics from the training objective. FDE and ADE are used after prediction, while the loss is minimized during training. We use a combined objective: a Huber term on coordinate-offset error, a geographic distance term in kilometers, and a soft land penalty:
+\[
+\mathcal{L}=\frac{1}{N}\sum_{i=1}^{N}w^{(i)}\left[0.5L_{\mathrm{Huber}}^{(i)}+0.5L_{\mathrm{geo}}^{(i)}\right]+\lambda_{\mathrm{land}}L_{\mathrm{land}}.
+\]
+The Huber term is more stable than MSE on noisy AIS data: for small errors it behaves like a quadratic loss, while for large errors it behaves like a linear loss and prevents outliers from dominating:
+\[
+\mathrm{Huber}_{\delta}(e)=\begin{cases}
+\frac{1}{2}e^2, & |e|\leq\delta,\\
+\delta\left(|e|-\frac{1}{2}\delta\right), & |e|>\delta.
+\end{cases}
+\]
+The geographic term gives coordinate errors a physical meaning in kilometers,
+\[
+L_{\mathrm{geo}}^{(i)}=\frac{1}{T}\sum_{t=0}^{T-1}d_{\mathrm{geo}}\!\left(\hat{P}_{t}^{(i)},P_t^{(i)}\right),
+\]
+where $d_{\mathrm{geo}}$ is a local kilometer-distance approximation that accounts for latitude. The land penalty softly discourages predictions that cross land. For autoregressive models, we use scheduled teacher forcing: early in training, the decoder sometimes receives the true previous step, and this probability later decreases to zero. We also use horizon curriculum, starting with a shorter horizon and gradually increasing to 12 hours. All runs use the same coastal train/validation/test split, and the final checkpoint is selected by validation performance rather than test performance.
+
+\section{Experimental Design}
+The first experiment asks whether neural models learn beyond constant-speed and constant-course motion, so all models are compared to the kinematic baseline. The second experiment sweeps history length for AR LSTM: 9, 12, 18, and 24 hours. This is the cleanest experiment for studying temporal context because the architecture is fixed. The third experiment compares architectures: autoregressive prediction versus direct prediction, LSTM versus Transformer, and short rolling prediction versus direct long-horizon prediction. The fourth experiment analyzes the adaptive model: whether the context gate truly chooses different windows, and what drives that choice.
+
+\section{Results}
+Unless otherwise noted, all results refer to the filtered coastal data with land-penalty weight $\lambda_{\mathrm{land}}=0.1$. The main metric is median FDE after 12 hours. To make the comparison transparent, we first present the full ranking table and then analyze each experiment separately.
+
+\begin{table}[!htbp]
+\centering
+\footnotesize
+\caption{Full coastal test-set ranking. The primary metric is median FDE at the 12-hour horizon; ADE is reported when available.}
+\label{tab:full-ranking}
+\resizebox{0.98\textwidth}{!}{%
+\begin{tabular}{c l c c c c}
+\toprule
+\textbf{Rank} & \textbf{Model} & \textbf{History} & \textbf{Mode} & \textbf{Median FDE [km]} & \textbf{Median ADE [km]} \\
+\midrule
+1 & Flat LSTM & 24h & Direct & \textbf{18.80} & 7.72 \\
+2 & Transformer & 24h & Attention & 19.40 & 8.24 \\
+3 & AR LSTM & 18h & AR & 19.71 & \textbf{7.35} \\
+4 & AR LSTM & 12h & AR & 19.99 & 7.39 \\
+5 & Adaptive Multi-Scale & 9+12+18+24h & Adaptive AR & 20.19 & 7.64 \\
+6 & AR LSTM & 24h & AR & 20.30 & 7.47 \\
+7 & AR LSTM & 9h & AR & 20.43 & 7.50 \\
+8 & Sliding 3h $\times$ 4 & 24h & Sliding & 22.44 & 7.61 \\
+-- & Kinematic baseline & Last state & Const. SOG/COG & 102.50 & -- \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Overall Model Ranking}
+Table~\ref{tab:full-ranking} and Figure~\ref{fig:ranking} present the overall model ranking. The kinematic baseline obtains median FDE of 102.5 km, while the main neural models lie in the range 18.8--22.4 km. Thus, deep models reduce final displacement error by roughly a factor of five. To compare architectures directly, all models are ranked by 12-hour median FDE on the same coastal test set.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.62\linewidth]{\figpath/fig2_model_ranking.jpg}
+\caption{Model ranking by 12-hour median FDE on the coastal test set. The direct Flat LSTM obtains the best result, followed by the Transformer. The kinematic baseline is not shown on the full scale.}
+\label{fig:ranking}
+\end{figure}
+
+The large gap between the kinematic baseline and all neural models shows that the networks are not merely smoothing the trajectory; they learn motion patterns absent from last-speed and last-course extrapolation. The best result is obtained by Flat LSTM, but the gap among the main neural models is small, about 3\%. A possible explanation is that direct prediction of the full 12-hour trajectory avoids autoregressive error accumulation. The Transformer is second, showing that attention over long history is useful, but not clearly better than the simpler Flat LSTM in this setting.
+
+\subsection{History-Length Sweep in AR LSTM}
+History length matters, but not monotonically. Moving from 9 to 12 hours improves median FDE; 18 hours gives the best result; and 24 hours slightly worsens it. To isolate the effect of history length, we kept the same AR LSTM architecture, data, and loss function, and changed only the number of history hours.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.56\linewidth]{\figpath/fig3_history_sweep.jpg}
+\caption{History-length sweep for the AR LSTM model. Error decreases from 9 to 18 hours, but rises again at 24 hours. More history is therefore not necessarily better.}
+\label{fig:sweep}
+\end{figure}
+
+A possible interpretation is that the LSTM has a bottleneck: the whole history is compressed into a final hidden state. Very old information may belong to a motion regime that is no longer relevant, so it can add noise or make optimization harder. Eighteen hours may be long enough to capture route and speed information, but not long enough to overload the encoder with outdated data.
+
+To test this interpretation, we compared the four AR checkpoints with history occlusion, gradient attribution, and hidden-state saturation on shared coastal windows. After zeroing older history steps, the final encoder state of the 24-hour model already reaches at least 95\% cosine similarity to its full-history state using only about 13 hours of recent context (about 11 hours for the 18-hour model). Occlusion agrees: zeroing the newest three hours increases mean FDE by roughly 6--9\,km, whereas zeroing the oldest three hours changes it by at most about 0.7\,km and, for AR\,24\,h, slightly improves error. Gradient mass of a final-offset loss is also concentrated on recent hours; for AR\,24\,h about 53\% falls on the newest three hours and only about 2\% on the oldest three. The 24-hour model additionally has the most negative layer-0 forget-gate bias, consistent with learning to discard early memory. Together, these results explain why 18 hours is best on the full test set: useful AR context saturates around roughly 12--15 hours, and extending the window to 24 hours mostly stretches the same bottleneck with weakly used---sometimes noisy---past.
+
+\subsection{Analysis by Motion Type}
+Bucket analysis shows a more nuanced story. For maneuvering trajectories, 9 hours of history is best; for straight trajectories, 18 hours is best. To test whether the overall 18-hour result comes uniformly from all trajectories, we compare relatively straight and maneuvering windows.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.58\linewidth]{\figpath/fig4_motion_buckets.jpg}
+\caption{Effect of history length for straight and maneuvering trajectories. Straight trajectories improve clearly up to 18 hours, while for maneuvering trajectories shorter context remains competitive.}
+\label{fig:buckets}
+\end{figure}
+
+Thus, the overall 18-hour optimum hides an internal difference: straight trajectories benefit from longer context, while for maneuvering trajectories old information may be less relevant. A maneuvering vessel is strongly affected by its most recent state; recent changes of course or speed matter more than older information. In contrast, a straight route may benefit from longer history because it helps identify a stable maritime route. This observation motivated the adaptive model.
+
+\subsection{Adaptive Model Result}
+The adaptive model was built to test whether history length can be learned from the data instead of fixed in advance. In practice, one shared LSTM encoder is applied to four nested windows of 9, 12, 18, and 24 hours. Each window produces a representation $h_H$. The representations are concatenated into $z=[h_9;h_{12};h_{18};h_{24}]$ and passed through a small MLP gate that outputs scores $s_H$. A softmax converts them into positive weights $\alpha_H$ that sum to one:
+\[
+\begin{array}{c}
+\alpha_H=\dfrac{e^{s_H}}{\sum_{K\in\{9,12,18,24\}}e^{s_K}},\qquad \sum_H\alpha_H=1,\\[4pt]
+h_{\mathrm{ctx}}=\sum_{H\in\{9,12,18,24\}}\alpha_H h_H.
+\end{array}
+\]
+Conceptually, this is similar to attention: the model has several representations of the same history and learns how much to look at each one. However, it is not self-attention over all time steps, but attention-like pooling over four temporal scales of the same trajectory, rather than a mixture of separate experts.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.60\linewidth]{\figpath/fig5_adaptive_gate.jpg}
+\caption{Adaptive gate behavior. Left: mean $\alpha$ weights for each history window. Right: which window receives the largest weight. The 24-hour window wins in about 86\% of examples.}
+\label{fig:adaptive}
+\end{figure}
+
+The hypothesis was that maneuvers or speed changes would prefer shorter history, while stable voyages would prefer longer history. In practice, Figure~\ref{fig:adaptive} shows a strong bias toward 24 hours. Mean soft weights are approximately $[0.15,0.22,0.29,0.34]$ for 9/12/18/24 hours, so the distribution remains a mild blend (normalized entropy near 1), while argmax selects 24 hours in about 86\% of examples only because the $\alpha_{24}-\alpha_{18}$ gap is small (about 0.05). Feature analysis supports a geographic soft prior: Spearman correlations between motion features and $\alpha$ were weak, while a random forest model trained to explain the gate weights found that latitude and longitude of the anchor point were among the most important features. The gate therefore learned partly a geographic prior rather than a clean rule such as ``maneuver needs short context'' and ``straight route needs long context.''
+
+Structural checks explain why the gate fails to adapt. Because the four contexts are nested suffixes of one shared encoder, their hidden states are nearly interchangeable ($h_{18}$ and $h_{24}$ have cosine similarity about 0.98), so reweighting them barely changes $h_{\mathrm{ctx}}$. On held-out windows, forcing a uniform $\alpha$ or a fixed 12-hour one-hot matches the learned gate's median FDE, whereas forcing always-24 hours is not better. Zeroing latitude/longitude channels shifts mean $|\Delta\alpha|$ only by about 0.02 and still leaves argmax dominated by 24 hours. Hence adaptivity does not discover the motion-dependent rule suggested by the bucket analysis; it mainly applies a soft long-context prior to redundant nested encodings.
+
+\section{Discussion, Limitations, and Future Work}
+The first conclusion is that neural models learn dynamics absent from the kinematic baseline. Reducing median FDE from 102.5 km to about 19 km shows that 12-hour prediction cannot be solved well by simply continuing the last speed and direction. The model must learn traffic routes, speed changes, turns, and geographic constraints.
+
+The second conclusion is that more history is not necessarily better. In the AR LSTM sweep, 18 hours outperforms 24 hours. This demonstrates a limitation of recurrent memory: even if the network receives more time steps, there is no guarantee that it uses them beneficially. Old information may require attention, filtering, or dedicated regularization. The occlusion, gradient, and hidden-state diagnostics above make this concrete: useful AR context saturates near the recent past, so additional early history can be unused or noisy.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.58\linewidth]{\figpath/fig6_error_growth.jpg}
+\caption{Growth of position error along the 12-hour forecast horizon. Error increases as the prediction moves farther from the anchor point, making long-horizon forecasting harder than nearby-step prediction.}
+\label{fig:growth}
+\end{figure}
+
+The third conclusion is that direct prediction can be preferable to autoregressive prediction. Flat LSTM obtains the best result, probably because it avoids accumulated errors over 72 prediction steps. The fourth conclusion is that adaptivity is not a magic solution: the adaptive gate almost always selects 24 hours by a small soft margin, faces nearly redundant nested states, and does not learn a strong motion-based switching rule. To make such a model successful, one may need a time-dependent gate, a penalty that encourages diverse choices, separate experts, or explicit motion features in the gate.
+
+The project has several limitations. The land mask is coarse, so the land penalty does not replace a full geographic model of shipping lanes and ports. The main results are on USA Combined after coastal filtering; other regions or inland routes may change the ranking. We also did not run a full hyperparameter sweep for every model. Future work should ablate the land-penalty weight, test additional history lengths for the Transformer, add geographic features such as distance from shore or local AIS density, and design adaptive gates that depend on future step or explicit motion features.
+
+\section{Conclusion}
+This project shows that 12-hour AIS trajectory prediction is a challenging sequence learning problem, but neural models greatly improve over simple kinematic extrapolation. The best result is obtained by a 24-hour Flat LSTM, while the Transformer is close behind. In the AR LSTM sweep, 18 hours is better than 24, because useful autoregressive context saturates around the recent past rather than the full 24-hour window. The adaptive model provides an important lesson: although it is more flexible, it tends to choose 24 hours almost always, sees nearly redundant context states, and is strongly affected by geography. The main conclusion is that temporal context matters, but learning how much history to use requires more than a simple gating mechanism.
+
+\section{Ethics Statement}
+\textbf{1. Introduction.} \textbf{Student names:} Amitai Gal and Shalev Shiriki. \textbf{Project title:} How Much History Do Deep Sequence Models Need for AIS Trajectory Prediction? This project develops and compares deep learning models for predicting vessel trajectories from public AIS data, for academic research on sequence learning. The models are not intended for operational use in navigation, safety, or enforcement, and their predictions are approximate.
+
+\textbf{2. LLM-generated stakeholder analysis.} We used ChatGPT to answer the required stakeholder questions. \textbf{Stakeholders:} (i) coastal and maritime-safety authorities; (ii) shipping companies and ports; (iii) vessel crews and operators. Authorities may benefit from traffic-load analysis and early risk awareness, but may also misuse uncertain forecasts in safety or enforcement decisions. Ports and shipping companies may benefit from planning arrivals and departures, but may over-trust predictions outside their validated region. Vessel crews and operators may be affected if a statistical model is treated as a navigation aid rather than as research output.
+
+\textbf{Explanations and responsibility:} Authorities should be told that the model is a statistical research tool and not a certified safety system, so it must not be used alone for critical decisions. Ports and companies should receive clear error metrics, geographic limits, and examples of failure cases. Crews should be told that the model does not replace human navigation, radar, warning systems, or safety procedures. Responsibility for these explanations belongs to both the model developers and any organization that deploys the system; in this course project, our responsibility is to report limitations, biases, and errors honestly.
+
+\textbf{3. Reflection on the AI output.} The LLM answer correctly identifies safety, deployment, and privacy risks, but it should be made more explicit that good average error does not imply safe behavior in individual cases. For example, a single large failure may matter if used for collision risk, enforcement, or monitoring. The explanation should therefore include uncertainty, failure examples, geographic limitations, possible surveillance implications, and a clear statement that the model is not a replacement for certified navigation or maritime-control systems.
+
+\section*{References}
+{\footnotesize
+\begin{enumerate}[leftmargin=1.5em,itemsep=0pt,parsep=0pt]
+\item L. P. Perera and C. Guedes Soares, ``Ocean Vessel Trajectory Estimation and Prediction Based on Extended Kalman Filter,'' \emph{ADAPTIVE}, 2010.
+\item S. Capobianco, L. M. Millefiori, N. Forti, P. Braca, and P. Willett, ``Deep Learning Methods for Vessel Trajectory Prediction based on Recurrent Neural Networks,'' \emph{arXiv:2101.02486}, 2021.
+\item D. Nguyen and R. Fablet, ``TrAISformer: A Transformer Network with Sparse Augmented Data Representation,'' \emph{arXiv:2109.03958}, 2021.
+\item D. Nguyen, R. Vadaine, G. Hajduch, R. Garello, and R. Fablet, ``GeoTrackNet: A Maritime Anomaly Detector using Probabilistic Neural Network Representation of AIS Tracks,'' \emph{arXiv:1912.00682}, 2019.
+\end{enumerate}
+}

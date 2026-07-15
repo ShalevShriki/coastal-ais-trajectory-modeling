@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Folium + PNG map for exp_final AR 9h predictions (history + GT + prediction)."""
+"""Folium + PNG map for exp_coastal AR 9h predictions (history + GT + prediction)."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +16,7 @@ if str(PROJECT.parent) not in sys.path:
 from proj.project.window_data import haversine_km, trajectory_splits
 
 SUBROOT = PROJECT
-RESULTS = SUBROOT / "data/results/USA Combined/unknown/exp_final/AR_9h/RNN_AR_LSTM"
+RESULTS = SUBROOT / "data/results/USA Combined/unknown/exp_coastal/AR_9h/RNN_AR_LSTM"
 DEFAULT_TRAJS = RESULTS / "lstm_ar_sample_trajectories.json"
 DEFAULT_OUT = RESULTS / "map_ar9h_examples.html"
 HISTORY_STEPS = 54  # 9h @ 10 min
@@ -262,7 +262,7 @@ def build_png_map(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Map AR 9h experiment trajectories.")
     parser.add_argument("--trajs", type=Path, default=DEFAULT_TRAJS)
-    parser.add_argument("--input", type=Path, default=Path("data/processed/combined_filtered_smart/train.parquet"))
+    parser.add_argument("--input", type=Path, default=Path("data/processed/combined_filtered_smart_coastal/train.parquet"))
     parser.add_argument("--html", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--png", type=Path, default=RESULTS / "map_ar9h_examples.png")
     args = parser.parse_args()

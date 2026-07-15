@@ -1,0 +1,7 @@
+Model: AR LSTM 12h (exp_coastal/AR_12h_noland)
+1 good:            idx=54  FDE=14.93
+2 hist many turns: idx=152 FDE=13.01
+3 track_07:        idx=90  FDE=2.21
+4 really good:     idx=135 FDE=3.41
+5 another good:    idx=164 FDE=17.54
+6 worst open-sea:  idx=32  FDE=234.51

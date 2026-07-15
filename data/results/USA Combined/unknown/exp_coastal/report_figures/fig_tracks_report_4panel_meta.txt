@@ -1,0 +1,6 @@
+Model: AR LSTM 12h (exp_coastal/AR_12h_noland)
+TL good:   idx=54,  FDE=14.93 km
+TR medium: idx=129, FDE=25.67 km
+BL bad sea (no land cut): idx=138, FDE=78.47 km
+BR track_07: idx=90, FDE=2.21 km
+Replaced previous mid idx=131 (land-crossing edge case).

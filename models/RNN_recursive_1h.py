@@ -28,6 +28,7 @@ from proj.project.models.training_utils import (
     add_training_improvement_args,
     apply_residual_prediction,
     enrich_history_row,
+    make_land_penalty,
     training_config_from_args,
     training_improvements_dict,
     unpack_window_batch,
@@ -139,10 +140,16 @@ class HourDisplacementRNN(nn.Module):
 class HourDisplacementLoss(nn.Module):
     """Huber on 1h displacement + scaled endpoint distance in km."""
 
-    def __init__(self, haversine_weight: float = 0.5, huber_delta: float = 0.01):
+    def __init__(
+        self,
+        haversine_weight: float = 0.5,
+        huber_delta: float = 0.01,
+        land_penalty: torch.nn.Module | None = None,
+    ):
         super().__init__()
         self.haversine_weight = float(haversine_weight)
         self.huber = nn.HuberLoss(delta=huber_delta, reduction="none")
+        self.land_penalty = land_penalty
 
     def forward(
         self,
@@ -163,7 +170,11 @@ class HourDisplacementLoss(nn.Module):
         loss = (1.0 - w) * huber + w * dist_km
         if sample_weight is not None:
             loss = loss * sample_weight
-        return loss.mean()
+        total = loss.mean()
+        if self.land_penalty is not None:
+            # SoftLandPenalty expects (B, T, 2); chunk endpoint is a single step.
+            total = total + self.land_penalty(pred_end.unsqueeze(1))
+        return total
 
 
 def train_one_epoch(
@@ -428,7 +439,10 @@ def run_recursive_sliding(
         input_dim=len(FEATURE_COLS), hidden_dim=hidden_dim, num_layers=num_layers,
         dropout=dropout, rnn_type=rnn_type,
     ).to(device)
-    criterion = HourDisplacementLoss(haversine_weight=training_config.haversine_weight)
+    criterion = HourDisplacementLoss(
+        haversine_weight=training_config.haversine_weight,
+        land_penalty=make_land_penalty(training_config.land_penalty_weight, device),
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5)
 
@@ -438,7 +452,8 @@ def run_recursive_sliding(
     )
     print(
         f"Train {chunk_hours:g}h displacement | eval {forecast_hours}h recursive | "
-        f"steps/chunk={steps_per_chunk} | residual={'on' if training_config.residual_naive else 'off'}"
+        f"steps/chunk={steps_per_chunk} | residual={'on' if training_config.residual_naive else 'off'} | "
+        f"land_penalty={training_config.land_penalty_weight:.3f}"
     )
 
     best_val = float("inf")

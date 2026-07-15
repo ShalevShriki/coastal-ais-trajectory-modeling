@@ -1,0 +1,2 @@
+Use fig_ar_straight_vs_maneuver.png in §6.3.
+fig_straight_vs_maneuver.png (all models) is appendix-only.

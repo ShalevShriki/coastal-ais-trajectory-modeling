@@ -48,6 +48,7 @@ from proj.project.models.training_utils import (
     apply_residual_prediction,
     curriculum_train_steps,
     enrich_history_row,
+    make_land_penalty,
     training_config_from_args,
     training_improvements_dict,
     unpack_window_batch,
@@ -811,6 +812,7 @@ def run_transformer(
         haversine_weight=training_config.haversine_weight,
         relative_weight=training_config.relative_loss_weight,
         min_path_km=training_config.min_path_km,
+        land_penalty=make_land_penalty(training_config.land_penalty_weight, device),
     )
     resample_minutes = (
         int(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10

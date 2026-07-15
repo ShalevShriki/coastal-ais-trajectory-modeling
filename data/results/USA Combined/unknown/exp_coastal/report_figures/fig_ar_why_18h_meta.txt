@@ -1,0 +1,24 @@
+AR why-18h diagnostics (shared n=800; official full-test medians differ slightly due to sampling)
+Subsample med FDE: 9h=20.31, 12h=18.94, 18h=19.62, 24h=18.09
+Official full-test med FDE: 9=20.43, 12=19.99, 18=19.71, 24=20.30
+KEY: occlusion newest3 >> oldest3 for all models; AR24 oldest3 even slightly helpful to REMOVE
+  occ 9h oldest3=0.71 newest3=8.99
+  occ 12h oldest3=0.36 newest3=6.13
+  occ 18h oldest3=0.05 newest3=6.14
+  occ 24h oldest3=-0.09 newest3=7.45
+  grad 9h newest3=56.9% oldest3=14.8%
+  grad 12h newest3=36.1% oldest3=10.3%
+  grad 18h newest3=21.3% oldest3=8.8%
+  grad 24h newest3=52.6% oldest3=1.8%
+  hidden 9h: 95% cos at 7h recent
+  hidden 12h: 95% cos at 10h recent
+  hidden 18h: 95% cos at 11h recent
+  hidden 24h: 95% cos at 13h recent
+AR24 effective context medFDE by keep-last-k:
+  keep6=18.68 (dmean +5.73)
+  keep9=18.96 (dmean +2.27)
+  keep12=18.95 (dmean +0.44)
+  keep15=18.89 (dmean +0.08)
+  keep18=18.97 (dmean -0.19)
+  keep21=18.68 (dmean -0.31)
+  keep24=18.09 (dmean +0.00)

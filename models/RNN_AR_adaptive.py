@@ -37,6 +37,7 @@ from proj.project.models.training_utils import (
     add_training_improvement_args,
     curriculum_train_steps,
     enrich_history_row,
+    make_land_penalty,
     scheduled_teacher_forcing,
     training_config_from_args,
     training_improvements_dict,
@@ -522,7 +523,10 @@ def run_adaptive_ar(
         gate_vessel_type=gate_vessel_type,
     ).to(device)
 
-    criterion = TrajectoryLoss(haversine_weight=training_config.haversine_weight)
+    criterion = TrajectoryLoss(
+        haversine_weight=training_config.haversine_weight,
+        land_penalty=make_land_penalty(training_config.land_penalty_weight, device),
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5)
     resample_minutes = int(step_minutes)

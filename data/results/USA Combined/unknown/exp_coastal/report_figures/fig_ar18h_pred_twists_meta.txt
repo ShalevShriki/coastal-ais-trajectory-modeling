@@ -1,0 +1,6 @@
+AR LSTM 18h — tracks where PREDICTION twists hour-by-hour
+Score: sum of |Δbearing| between consecutive hourly segments + big turns (>25°) + tortuosity
+
+1. idx=192 turnΣ=189.2° max_hour_Δ=146.6° big=1 tort=3.21 net_pred=97.7 FDE=73.5
+2. idx=27 turnΣ=258.7° max_hour_Δ=131.7° big=3 tort=1.27 net_pred=98.1 FDE=92.0
+3. idx=32 turnΣ=148.0° max_hour_Δ=22.0° big=0 tort=1.37 net_pred=147.8 FDE=230.5

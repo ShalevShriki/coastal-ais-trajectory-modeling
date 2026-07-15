@@ -1,0 +1,175 @@
+% AIS trajectory report — target ≤ 8 pages
+% Import into LyX: File → Import → LaTeX (plain)...
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1.8cm]{geometry}
+\usepackage{graphicx,booktabs,amsmath,amssymb,microtype,enumitem,caption,siunitx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{setspace}
+\setstretch{1.05}
+\setlist{nosep,leftmargin=1.2em}
+\captionsetup{font=small,skip=4pt}
+\graphicspath{{data/results/USA Combined/unknown/exp_coastal/report_figures/}}
+\newcommand{\figpath}{data/results/USA Combined/unknown/exp_coastal/report_figures}
+
+\title{\vspace{-1.2em}How Much History Do Deep Sequence Models Need for AIS Trajectory Prediction?}
+\author{Amitai Gal \and Shalev Shiriki\\[2pt]
+{\normalsize Technion --- Faculty of Electrical and Computer Engineering}\\[2pt]
+{\normalsize Final Project Report --- Deep Learning Course 046211 \quad July 14, 2026}}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.4em}
+
+\begin{abstract}
+\vspace{-0.3em}
+This project studies vessel trajectory prediction from Automatic Identification System (AIS) data as a sequence learning problem. Given a history of position, speed, and direction sampled every 10 minutes, we predict latitude and longitude for the next 12 hours. The focus is how much temporal context a sequence model needs, and whether a more complex architecture uses long history more effectively.
+We compare constant-speed/course kinematic extrapolation; fixed-context AR LSTMs with 9, 12, 18, and 24\,h history; a Flat LSTM that predicts all future steps at once; a Transformer; a short-window rolling model; and an Adaptive Multi-Scale RNN that gates over several history lengths. Neural models reduce median final displacement error (FDE) from 102.5\,km to roughly 19--20\,km. The best model is a 24\,h Flat LSTM (18.80\,km); the Transformer follows (19.40\,km). In a controlled AR LSTM sweep, \textbf{18\,h is best} (19.71\,km), while 24\,h does not improve. Diagnostics show encoder states and gradients concentrate on recent history, so longer windows can add noise. The adaptive gate prefers 24\,h only by a small soft margin; its four context states are nearly redundant, and forced uniform/fixed gates match learned performance. Long history matters, but useful adaptive history selection does not emerge from a simple gate.
+\end{abstract}
+\vspace{-0.5em}
+
+\section{Introduction and Motivation}
+\vspace{-0.25em}
+AIS broadcasts vessel position, speed over ground (SOG), course over ground (COG), heading, and time. These measurements form a temporal sequence, so trajectory prediction is a natural sequence-modeling task. We forecast a full 12-hour path: early errors can accumulate into large final displacements.
+
+From a deep learning viewpoint, the task combines RNN/LSTM memory, autoregressive (AR) decoding, Transformer self-attention, and training choices such as loss design, teacher forcing, and curriculum learning. The central question is: \emph{how much history is useful for 12\,h prediction?} We test whether 24\,h is always better than 18 or 12\,h, whether a Transformer exploits long context better than an LSTM, and whether an adaptive gate can choose short vs.\ long history by itself.
+
+Prior work splits into kinematic/statistical methods (dead reckoning, Kalman/EKF)~\cite{perera2010}; RNN/seq2seq AIS predictors~\cite{capobianco2021}; and attention/Transformer or geographic models such as TrAISformer and GeoTrackNet~\cite{nguyen2021traisformer,nguyen2019geo}. Our contribution is a controlled history-length study with fixed data, horizon, and metrics, plus an analysis of whether adaptivity learns a real switching rule.
+
+\section{Data and Window Construction}
+\vspace{-0.25em}
+We use public NOAA AIS merged into USA Combined. Trajectories are resampled to \(\Delta t=10\)\,min. Each example stores up to \(T_h=144\) history steps (24\,h) and \(T_f=72\) future steps (12\,h). Fixed-context runs use history suffixes of 54/72/108/144 steps (9/12/18/24\,h). All models start from the same \emph{anchor} (last observed position).
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.88\linewidth]{\figpath/fig_tracks_report_3panel_percentiles.png}
+\caption{Example test predictions (AR). Gray: history; blue: true future; green: prediction. Long-horizon error is a trajectory---not a single-point---failure mode.}
+\label{fig:examples}
+\end{figure}
+
+Features include position, SOG, sine/cosine of COG and heading, deltas, and north/east velocity. Targets are anchor offsets
+\(y_t=P_t-P_0\), \(\hat P_t=P_0+\hat y_t\), which reduce absolute-location dependence.
+
+\subsection{Data Filtering}
+A stationarity filter removes almost-static windows; a smart-motion filter removes abnormal loops; inland removal drops rivers/canals when most history points are not near open water. After filtering, 363{,}014/535{,}967 windows remain (67.7\%). Train/validation/test splits are by trajectory ID (255{,}133 / 34{,}549 / 73{,}332) to avoid voyage leakage.
+
+\section{Metrics and Motion Buckets}
+\vspace{-0.25em}
+We measure geodesic error with Haversine distance (km). \textbf{FDE} is the error after 12\,h; \textbf{ADE} averages error over all 72 future steps. Ranking uses \textbf{median FDE} because long-horizon errors are heavy-tailed. For analysis only (not training), windows are labeled \emph{straight} vs.\ \emph{maneuver} from history features such as straightness \(d_{\mathrm{direct}}/L_{\mathrm{path}}\) and COG variability.
+
+\section{Models and Training}
+\vspace{-0.25em}
+\paragraph{Kinematic baseline.} Extrapolate the last SOG and COG for 12\,h.
+\paragraph{Fixed-context AR LSTM.} Encoder--decoder LSTM (hidden 256, 2 layers, dropout 0.2). Decoder is free-running at test time. Same architecture for 9/12/18/24\,h.
+\paragraph{Flat LSTM.} Same encoder size; predicts all 72 offsets at once (no AR feedback).
+\paragraph{Transformer.} Encoder-only: \(d{=}128\), 8 heads, 4 layers, FFN 512.
+\paragraph{Sliding 3\,h\(\times\)4.} Short predictor rolled four times to 12\,h.
+\paragraph{Adaptive Multi-Scale AR.} Shared LSTM encodes nested 9/12/18/24\,h suffixes; an MLP gate produces \(\alpha=\mathrm{softmax}(\cdot)\); context is \(\sum_k\alpha_k h_k\).
+
+\begin{table}[!t]
+\centering
+\scriptsize
+\caption{Coastal test set. Bold: best in column. \(\lambda_{\mathrm{land}}{=}0.1\).}
+\label{tab:models}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}llcrrr@{}}
+\toprule
+Model & Arch. & Hist. & Params & Med.\ FDE & Med.\ ADE \\
+\midrule
+Kinematic & SOG+COG & --- & --- & 102.48 & --- \\
+AR LSTM 9h & AR LSTM \(256{\times}2\) & 9h & 1.63M & 20.43 & 7.50 \\
+AR LSTM 12h & AR LSTM \(256{\times}2\) & 12h & 1.63M & 19.99 & 7.39 \\
+AR LSTM 18h & AR LSTM \(256{\times}2\) & 18h & 1.63M & 19.71 & \textbf{7.35} \\
+AR LSTM 24h & AR LSTM \(256{\times}2\) & 24h & 1.63M & 20.30 & 7.47 \\
+Flat LSTM & Direct LSTM \(256{\times}2\) & 24h & 0.91M & \textbf{18.80} & 7.72 \\
+Transformer & 4L/8H & 24h & 1.00M & 19.40 & 8.24 \\
+Sliding 3h\(\times\)4 & Rollout LSTM & 24h & 0.84M & 22.44 & 7.61 \\
+Adaptive AR & Shared LSTM+gate & multi & 1.90M & 20.19 & 7.64 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Training minimizes a mix of Huber offset loss, local geographic km loss, and soft land penalty \(\lambda_{\mathrm{land}}L_{\mathrm{land}}\). AR models use scheduled teacher forcing (\(0.3\to0\)) and horizon curriculum from 6\,h. Checkpoints are selected by validation loss.
+
+\section{Results}
+\vspace{-0.25em}
+Unless noted, results use the coastal test set with \(\lambda_{\mathrm{land}}=0.1\).
+
+\subsection{Overall Ranking}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.72\linewidth]{\figpath/fig_model_ranking_fde.png}
+\caption{Median FDE ranking (kinematic off-scale). Flat LSTM best; gaps among top neural models are small (\(\sim\)1--2\,km).}
+\label{fig:rank}
+\end{figure}
+Neural models cut median FDE by about \(5\times\) vs.\ kinematics (Table~\ref{tab:models}, Fig.~\ref{fig:rank}). Flat LSTM wins: direct decoding avoids feeding early errors back into later steps. The Transformer is second, showing attention helps but is not clearly worth the extra complexity here.
+
+\subsection{AR History Sweep --- Why 18\,h Beats 24\,h}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.62\linewidth]{\figpath/fig_ar_context_sweep.png}
+\caption{AR LSTM history sweep: median FDE improves to 18\,h then worsens at 24\,h.}
+\label{fig:sweep}
+\end{figure}
+With architecture fixed, median FDE is non-monotonic: \(20.43\to19.99\to19.71\to20.30\)\,km for 9/12/18/24\,h (Fig.~\ref{fig:sweep}). Diagnostics on shared windows explain why more history is not better:
+\begin{itemize}
+\item \textbf{Occlusion:} zeroing the newest 3\,h raises mean FDE by \(\sim\)6--9\,km; zeroing the oldest 3\,h changes it by \(\lesssim0.7\)\,km, and for AR\,24\,h slightly \emph{helps} (\(-0.09\)\,km).
+\item \textbf{Gradients:} AR\,24\,h places 52.6\% of \(|\partial L/\partial x_t|\) mass on the newest 3\,h and only 1.8\% on the oldest 3\,h.
+\item \textbf{Hidden state:} \(\geq\)95\% cosine match to the full-history encoder state needs only \(\sim\)11--13\,h of recent context even in the 24\,h model.
+\item \textbf{Weights:} AR\,24\,h has the most negative LSTM forget bias (layer~0), i.e., a stronger tendency to discard early memory.
+\end{itemize}
+Thus the encoder bottleneck largely saturates near \(\sim\)12\,h; the extra 6\,h in a 24\,h window is weakly used and can add noise.
+
+\subsection{Straight vs.\ Maneuver}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.60\linewidth]{\figpath/fig_ar_straight_vs_maneuver.png}
+\caption{Preferred history length depends on motion type: maneuvers favor short context; straight routes favor longer.}
+\label{fig:buckets}
+\end{figure}
+Bucket analysis (Fig.~\ref{fig:buckets}): maneuvering windows prefer 9\,h; straight windows prefer 18\,h. The global 18\,h optimum is therefore a compromise across motion regimes---exactly the motivation for an adaptive gate.
+
+\subsection{Adaptive Gate --- What It Actually Learned}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.70\linewidth]{\figpath/fig_adaptive_alphas.png}
+\caption{Gate soft weights (left) and argmax rates (right). Softmax is nearly uniform; argmax picks 24\,h in \(\sim\)86\% of examples by a small margin.}
+\label{fig:alpha}
+\end{figure}
+On the full test set, mean \(\alpha\approx[0.15,0.22,0.29,0.34]\) for 9/12/18/24\,h, yet argmax is 24\,h in 86\% of windows because the \(\alpha_{24}{-}\alpha_{18}\) gap is only \(\sim\)0.05. The gate's final bias already favors longer contexts. Critically, nested suffixes through a \emph{shared} encoder yield nearly identical states (\(h_{18}\)--\(h_{24}\) cosine \(0.984\)). Forcing uniform \(\alpha\) or always-12\,h matches learned median FDE on held-out windows (\(\approx\)19.5\,km); always-24\,h is not better. Motion--\(\alpha\) correlations are weak; geography (anchor lat/lon) is a stronger soft driver than maneuver features. The gate therefore does \emph{not} implement ``maneuver\(\to\)short / straight\(\to\)long.''
+
+\section{Discussion, Limitations, and Future Work}
+\vspace{-0.25em}
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.58\linewidth]{\figpath/fig_error_vs_horizon.png}
+\caption{Error grows with forecast hour; long-horizon prediction is substantially harder than nearby steps.}
+\label{fig:growth}
+\end{figure}
+(1)~Neural nets learn dynamics beyond last-state kinematics. (2)~More history is not always better under a fixed LSTM bottleneck. (3)~Direct prediction can beat AR by avoiding accumulation (Fig.~\ref{fig:growth}). (4)~Adaptivity needs stronger inductive bias than soft pooling of redundant nested encodings---e.g., separate experts, step-dependent gates, or explicit motion features.
+
+Limitations: coarse land mask; USA coastal data only; no full per-model hyperparameter sweep. Future work: land-penalty ablation, Transformer history sweep, geographic features (shore/port density), and gates conditioned on straightness/COG variance or future time index.
+
+\section{Conclusion}
+\vspace{-0.25em}
+12\,h AIS forecasting is hard, but deep models improve dramatically over kinematics. Best overall: Flat LSTM 24\,h (18.80\,km). Best AR history length: 18\,h---not 24\,h---because useful context saturates and older hours contribute little. A simple multi-scale gate collapses to a soft 24\,h prior without learning motion-aware switching. Temporal context matters; learning \emph{how much} history to use requires more than a shallow gate.
+
+\section{Ethics Statement}
+\vspace{-0.25em}
+\textbf{Students:} Amitai Gal, Shalev Shiriki.
+\textbf{Title:} How Much History Do Deep Sequence Models Need for AIS Trajectory Prediction?
+This academic project compares sequence models on public AIS data. Predictions are approximate and \textbf{not} for navigation, safety, or enforcement.
+
+\textbf{LLM stakeholder analysis.} We used ChatGPT to draft stakeholder answers. Stakeholders: (i)~coastal/maritime-safety authorities; (ii)~shipping companies and ports; (iii)~vessel crews/operators. Authorities and industry may misuse uncertain forecasts; crews may be affected if research outputs are treated as navigation aids; movement data also raises privacy/surveillance concerns.
+Explanations: call the system a statistical research tool, report error metrics/limits/failure cases, and state that it does not replace human navigation, radar, or certified procedures. Responsibility lies with developers and any deploying organization; in this course project we must report limits and failure modes honestly.
+
+\textbf{Reflection.} Good average FDE does not imply safe individual cases. Ethical communication must include uncertainty, geographic limits, failure examples, privacy risks, and a clear ban on replacing certified maritime systems.
+
+\begin{thebibliography}{9}
+\footnotesize
+\bibitem{perera2010} L.~P. Perera and C.~Guedes Soares, ``Ocean Vessel Trajectory Estimation and Prediction Based on Extended Kalman Filter,'' \emph{ADAPTIVE}, 2010.
+\bibitem{capobianco2021} S.~Capobianco et al., ``Deep Learning Methods for Vessel Trajectory Prediction based on Recurrent Neural Networks,'' arXiv:2101.02486, 2021.
+\bibitem{nguyen2021traisformer} D.~Nguyen and R.~Fablet, ``TrAISformer,'' arXiv:2109.03958, 2021.
+\bibitem{nguyen2019geo} D.~Nguyen et al., ``GeoTrackNet,'' arXiv:1912.00682, 2019.
+\end{thebibliography}
+\end{document}

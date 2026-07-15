@@ -48,6 +48,7 @@ from proj.project.models.training_utils import (
     apply_residual_prediction,
     curriculum_train_steps,
     enrich_history_row,
+    make_land_penalty,
     scheduled_teacher_forcing,
     training_config_from_args,
     training_improvements_dict,
@@ -672,6 +673,7 @@ def run_rnn_ar(
         relative_weight=training_config.relative_loss_weight,
         min_path_km=training_config.min_path_km,
         target_mode=target_mode,
+        land_penalty=make_land_penalty(training_config.land_penalty_weight, device),
     )
     resample_minutes = (
         int(df["resample_minutes"].iloc[0]) if "resample_minutes" in df.columns else 10
@@ -679,6 +681,7 @@ def run_rnn_ar(
     base_tf = teacher_forcing_ratio
     print(
         f"Loss: Huber + Haversine (w={training_config.haversine_weight:.2f}) | "
+        f"land_penalty={training_config.land_penalty_weight:.3f} | "
         f"TF start={base_tf:.2f} scheduled={'on' if training_config.scheduled_teacher_forcing else 'off'} | "
         f"residual naive={'on' if training_config.residual_naive else 'off'} | "
         f"target={target_mode} | "

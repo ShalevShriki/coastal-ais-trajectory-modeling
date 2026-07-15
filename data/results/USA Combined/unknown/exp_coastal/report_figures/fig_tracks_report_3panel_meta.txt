@@ -1,0 +1,5 @@
+Model: AR LSTM 12h (exp_coastal/AR_12h_noland)
+Panel left  (good): idx=164, FDE=17.54 km, true travel=117.2 km
+Panel mid   (bad):  idx=131, FDE=123.00 km, true travel=127.2 km
+Panel right (track_07 / idx90): idx=90, FDE=2.21 km, true travel=65.2 km
+Titles show raw FDE only (no good/bad labels on the figure).

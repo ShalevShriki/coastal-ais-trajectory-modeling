@@ -1,0 +1,27 @@
+Model tested: AR LSTM 12h (exp_coastal/AR_12h_noland)
+Architecture: encoder-decoder AR LSTM (RNN_AR_LSTM)
+History context: 12 hours (72 steps @ 10 min)
+Prediction horizon: 12 hours (72 steps)
+Data: USA Combined coastal-filtered (combined_filtered_smart_coastal)
+Land penalty: 0.0 (AR_12h_noland run under exp_coastal)
+Source predictions: lstm_ar_sample_trajectories.json
+
+Pick any of these PNGs for the report:
+  Folder: /home/projects/crml-prj10844/deep_learning/project/proj/project/data/results/USA Combined/unknown/exp_coastal/report_figures/map_track_pngs
+  Interactive HTML: /home/projects/crml-prj10844/deep_learning/project/proj/project/data/results/USA Combined/unknown/exp_coastal/report_figures/map_clear_tracks_ar12h.html
+
+  01. idx= 54  Straight (good) #1 | true 243 km | dir=1.00 ct=2km | FDE 14.9 km
+  02. idx=164  Straight (good) #2 | true 117 km | dir=0.96 ct=10km | FDE 17.5 km
+  03. idx=129  Straight (medium) #1 | true 249 km | dir=1.00 ct=8km | FDE 25.7 km
+  04. idx=182  Straight (medium) #2 | true 87 km | dir=0.95 ct=4km | FDE 29.4 km
+  05. idx=107  Straight/long (high FDE) #1 | true 345 km | dir=1.00 ct=5km | FDE 102.3 km
+  06. idx=  8  Straight/long (high FDE) #2 | true 339 km | dir=1.00 ct=8km | FDE 134.3 km
+  07. idx= 90  Maneuver (good pred) #1 | true 65 km | dir=0.62 ct=23km | FDE 2.2 km
+  08. idx= 48  Maneuver (good pred) #2 | true 48 km | dir=0.72 ct=9km | FDE 6.3 km
+  09. idx= 67  Maneuver (medium pred) #1 | true 50 km | dir=0.37 ct=32km | FDE 52.7 km
+  10. idx=147  Maneuver (medium pred) #2 | true 61 km | dir=0.41 ct=12km | FDE 48.1 km
+  11. idx= 42  Maneuver (medium pred) #3 | true 127 km | dir=0.30 ct=6km | FDE 29.6 km
+  12. idx=113  Maneuver (hard) #1 | true 56 km | dir=0.26 ct=59km | FDE 56.2 km
+  13. idx=179  Maneuver (hard) #2 | true 72 km | dir=0.56 ct=32km | FDE 71.5 km
+  14. idx= 22  Maneuver (hard) #3 | true 49 km | dir=0.56 ct=19km | FDE 116.8 km
+  15. idx=106  Maneuver (extra) #1 | true 70 km | dir=0.58 ct=21km | FDE 113.4 km

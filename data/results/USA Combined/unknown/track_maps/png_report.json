@@ -1,9 +1,0 @@
-{
-  "png_paths": [
-    "/home/projects/crml-prj10844/deep_learning/project/proj/project/data/results/USA Combined/unknown/track_maps/png_good_segments_random.png",
-    "/home/projects/crml-prj10844/deep_learning/project/proj/project/data/results/USA Combined/unknown/track_maps/png_corrupt_filtered_random.png",
-    "/home/projects/crml-prj10844/deep_learning/project/proj/project/data/results/USA Combined/unknown/track_maps/png_segments_pointcloud_by_coast.png"
-  ],
-  "segments_ok": true,
-  "filtered_corrupt_lon_equals_lat": true
-}

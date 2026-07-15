@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Folium + PNG map for exp_final AR 12h predictions (history + GT + prediction)."""
+"""Folium + PNG map for exp_coastal AR 12h predictions (history + GT + prediction)."""
 from __future__ import annotations
 
 import argparse
@@ -16,7 +16,7 @@ if str(PROJECT.parent) not in sys.path:
 from proj.project.window_data import haversine_km
 
 SUBROOT = PROJECT
-RESULTS = SUBROOT / "data/results/USA Combined/unknown/exp_final/AR_12h/RNN_AR_LSTM"
+RESULTS = SUBROOT / "data/results/USA Combined/unknown/exp_coastal/AR_12h/RNN_AR_LSTM"
 DEFAULT_TRAJS = RESULTS / "lstm_ar_sample_trajectories.json"
 DEFAULT_OUT = RESULTS / "map_ar12h_examples.html"
 HISTORY_STEPS = 72  # 12h @ 10 min
@@ -78,14 +78,21 @@ def load_history_12h(
     return hist
 
 
-def pick_indices(traj: dict, *, seed: int = 7, n_each: int = 2) -> list[tuple[int, str]]:
+def pick_indices(
+    traj: dict,
+    *,
+    seed: int = 7,
+    n_each: int = 2,
+    min_net_km: float = 5.0,
+    prefer_long: bool = False,
+) -> list[tuple[int, str]]:
     rng = np.random.default_rng(seed)
     anchor = traj["anchor"]
     gt = traj["y_true"]
     pred = traj["y_pred"]
     err = haversine_km(gt[:, -1, 0], gt[:, -1, 1], pred[:, -1, 0], pred[:, -1, 1])
     net = haversine_km(anchor[:, 0], anchor[:, 1], gt[:, -1, 0], gt[:, -1, 1])
-    moving = net > 5.0
+    moving = net > min_net_km
     low_pool = np.where(moving & (err < 15))[0]
     mid_pool = np.where(moving & (err >= 15) & (err < 40))[0]
     high_pool = np.where(moving & (err >= 40))[0]
@@ -102,10 +109,37 @@ def pick_indices(traj: dict, *, seed: int = 7, n_each: int = 2) -> list[tuple[in
         (mid_pool, "Medium error"),
         (high_pool, "High error"),
     ]:
-        chosen = rng.choice(pool, size=min(n_each, len(pool)), replace=False)
+        if prefer_long and len(pool) > 0:
+            # Prefer longest true displacements within each error band
+            order = pool[np.argsort(-net[pool])]
+            chosen = order[: min(n_each, len(order))]
+        else:
+            chosen = rng.choice(pool, size=min(n_each, len(pool)), replace=False)
         for j, idx in enumerate(chosen):
             suffix = f" #{j + 1}" if n_each > 1 else ""
-            picks.append((int(idx), f"{label}{suffix}"))
+            picks.append((int(idx), f"{label}{suffix} ({net[idx]:.0f} km)"))
+    return picks
+
+
+def pick_longest_tracks(traj: dict, *, n: int = 6, min_net_km: float = 40.0) -> list[tuple[int, str]]:
+    """Top-N longest true 12h displacements, labeled with FDE."""
+    anchor = traj["anchor"]
+    gt = traj["y_true"]
+    pred = traj["y_pred"]
+    err = haversine_km(gt[:, -1, 0], gt[:, -1, 1], pred[:, -1, 0], pred[:, -1, 1])
+    net = haversine_km(anchor[:, 0], anchor[:, 1], gt[:, -1, 0], gt[:, -1, 1])
+    pool = np.where(net >= min_net_km)[0]
+    if len(pool) == 0:
+        pool = np.arange(len(net))
+    order = pool[np.argsort(-net[pool])][:n]
+    picks = []
+    for rank, idx in enumerate(order, start=1):
+        picks.append(
+            (
+                int(idx),
+                f"Long #{rank} ({net[idx]:.0f} km true, FDE {err[idx]:.0f} km)",
+            )
+        )
     return picks
 
 
@@ -129,7 +163,7 @@ def build_folium_map(
     legend = """
     <div style="position:fixed;bottom:20px;left:20px;z-index:9999;background:white;
     border:2px solid #333;border-radius:8px;padding:12px;font-size:13px;line-height:1.6;
-    max-width:280px;box-shadow:0 2px 8px rgba(0,0,0,.15);">
+    max-width:300px;box-shadow:0 2px 8px rgba(0,0,0,.15);">
     <b>AR 12h → 12h forecast</b><br>
     <span style="color:#757575">&#9644;</span> Gray — 12h history<br>
     <span style="color:orange">&#9733;</span> Orange — NOW (anchor)<br>
@@ -140,6 +174,7 @@ def build_folium_map(
     <small>Toggle layers (top-right) to focus on one example.</small>
     </div>
     """
+    # Keep existing legend string replacement minimal — already similar
     m.get_root().html.add_child(Element(legend))
 
     for row_i, title in indices:
@@ -212,15 +247,30 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Map AR 12h experiment trajectories.")
     parser.add_argument("--trajs", type=Path, default=DEFAULT_TRAJS)
     parser.add_argument(
-        "--input", type=Path, default=Path("data/processed/combined_filtered_smart/train.parquet")
+        "--input", type=Path, default=Path("data/processed/combined_filtered_smart_coastal/train.parquet")
     )
     parser.add_argument("--html", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--n-each", type=int, default=2, help="Examples per error band")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--long-tracks",
+        action="store_true",
+        help="Select the longest true 12h displacements (instead of error bands).",
+    )
+    parser.add_argument("--n-long", type=int, default=6, help="How many long tracks to show")
+    parser.add_argument(
+        "--min-net-km",
+        type=float,
+        default=40.0,
+        help="Minimum true net displacement (km) for --long-tracks",
+    )
     args = parser.parse_args()
 
     traj = load_trajs(args.trajs)
-    indices = pick_indices(traj, seed=args.seed, n_each=args.n_each)
+    if args.long_tracks:
+        indices = pick_longest_tracks(traj, n=args.n_long, min_net_km=args.min_net_km)
+    else:
+        indices = pick_indices(traj, seed=args.seed, n_each=args.n_each, prefer_long=True)
     print(f"Selected {len(indices)} examples:")
     for i, title in indices:
         err = float(
@@ -231,7 +281,15 @@ def main() -> None:
                 traj["y_pred"][i, -1, 1],
             )
         )
-        print(f"  [{i}] {title}: FDE={err:.1f} km  anchor={traj['anchor'][i]}")
+        net = float(
+            haversine_km(
+                traj["anchor"][i, 0],
+                traj["anchor"][i, 1],
+                traj["y_true"][i, -1, 0],
+                traj["y_true"][i, -1, 1],
+            )
+        )
+        print(f"  [{i}] {title}: FDE={err:.1f} km  net={net:.1f} km  anchor={traj['anchor'][i]}")
 
     histories = {i: load_history_12h(args.input, traj["anchor"][i]) for i, _ in indices}
     build_folium_map(traj, histories, indices, args.html)

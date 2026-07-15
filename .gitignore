@@ -39,6 +39,12 @@ data/results/**/*.log
 LOG/
 slurm_logs/
 
+# Local archive: keep scripts/docs in git; skip heavy dumps on disk
+old_versions/data_processed/
+old_versions/data_models/
+old_versions/data_results/
+old_versions/logs/
+
 # System
 .DS_Store
 .env

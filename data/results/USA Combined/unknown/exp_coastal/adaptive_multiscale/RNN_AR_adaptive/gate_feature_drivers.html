@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Adaptive gate — feature drivers</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 24px; max-width: 960px; color: #222; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0 24px; }
+th, td { border: 1px solid #ccc; padding: 6px 10px; font-size: 13px; }
+th { background: #f4f4f4; }
+.note { color: #555; font-size: 14px; line-height: 1.5; }
+.takeaways { background:#f7fafc; border:1px solid #cbd5e1; border-radius:8px; padding:12px 16px; }
+</style></head><body>
+<h1>Adaptive gate — feature drivers</h1>
+<p class="note">n=15,000 test windows. The gate sees encoder hidden states (not raw AIS
+features). This report correlates <b>observable motion summaries</b> with α to interpret
+what the gate prefers.</p>
+<div class="takeaways"><b>Takeaways</b><ul><li>Strongest Spearman association overall: <b>path_km_24h</b> (max |r|=0.172).</li><li>Best RF driver of long-vs-short preference (α_24h−α_9h): <b>anchor_lon</b>.</li><li>Gate still puts most mass on 18–24h contexts on average; motion features modulate this only mildly.</li></ul></div>
+
+<h2>Mean α / argmax</h2>
+<p>Mean: 9h=0.145, 12h=0.224, 18h=0.289, 24h=0.342</p>
+<p>Argmax %: 9h=0.3%, 12h=1.7%, 18h=12.0%, 24h=86.0%</p>
+
+
+<h2>Spearman correlation (feature ↔ α)</h2>
+<p class="note">Sorted by max |r|. Positive = higher feature → higher weight on that context.</p>
+<table>
+<tr><th>feature</th><th>α 9h</th><th>α 12h</th><th>α 18h</th><th>α 24h</th></tr>
+<tr><td>path_km_24h</td><td style='text-align:right'>+0.032</td><td style='text-align:right'>+0.103</td><td style='text-align:right'>+0.172</td><td style='text-align:right'>-0.148</td></tr><tr><td>mean_sog</td><td style='text-align:right'>+0.045</td><td style='text-align:right'>+0.106</td><td style='text-align:right'>+0.167</td><td style='text-align:right'>-0.156</td></tr><tr><td>net_disp_km_24h</td><td style='text-align:right'>-0.063</td><td style='text-align:right'>+0.072</td><td style='text-align:right'>+0.135</td><td style='text-align:right'>-0.045</td></tr><tr><td>maneuver_mean_abs_dcog</td><td style='text-align:right'>+0.034</td><td style='text-align:right'>-0.027</td><td style='text-align:right'>-0.132</td><td style='text-align:right'>+0.046</td></tr><tr><td>max_abs_dcog</td><td style='text-align:right'>+0.052</td><td style='text-align:right'>+0.007</td><td style='text-align:right'>-0.112</td><td style='text-align:right'>+0.012</td></tr><tr><td>abs_dlon_24h</td><td style='text-align:right'>-0.054</td><td style='text-align:right'>+0.065</td><td style='text-align:right'>+0.108</td><td style='text-align:right'>-0.033</td></tr><tr><td>abs_dlat_24h</td><td style='text-align:right'>-0.047</td><td style='text-align:right'>+0.051</td><td style='text-align:right'>+0.105</td><td style='text-align:right'>-0.039</td></tr><tr><td>accel_mean_abs_dsog</td><td style='text-align:right'>+0.104</td><td style='text-align:right'>+0.000</td><td style='text-align:right'>-0.066</td><td style='text-align:right'>-0.041</td></tr><tr><td>anchor_lon</td><td style='text-align:right'>-0.099</td><td style='text-align:right'>-0.077</td><td style='text-align:right'>+0.044</td><td style='text-align:right'>+0.083</td></tr><tr><td>straightness</td><td style='text-align:right'>-0.089</td><td style='text-align:right'>+0.020</td><td style='text-align:right'>+0.054</td><td style='text-align:right'>+0.028</td></tr><tr><td>std_sog</td><td style='text-align:right'>-0.031</td><td style='text-align:right'>+0.013</td><td style='text-align:right'>+0.049</td><td style='text-align:right'>-0.013</td></tr><tr><td>anchor_lat</td><td style='text-align:right'>-0.047</td><td style='text-align:right'>-0.014</td><td style='text-align:right'>+0.036</td><td style='text-align:right'>+0.021</td></tr>
+</table>
+
+<h2>Random-forest surrogate importance</h2>
+<p class="note">RF regressors predict each α (and α_24h−α_9h) from motion features.</p>
+<h3>Predicting α_9h</h3><ol><li><b>anchor_lat</b>: 0.263</li><li><b>anchor_lon</b>: 0.236</li><li><b>std_sog</b>: 0.133</li><li><b>accel_mean_abs_dsog</b>: 0.097</li><li><b>straightness</b>: 0.072</li><li><b>abs_dlat_24h</b>: 0.042</li><li><b>max_abs_dcog</b>: 0.031</li><li><b>maneuver_mean_abs_dcog</b>: 0.030</li></ol><h3>Predicting α_12h</h3><ol><li><b>anchor_lon</b>: 0.265</li><li><b>anchor_lat</b>: 0.243</li><li><b>std_sog</b>: 0.113</li><li><b>max_abs_dcog</b>: 0.080</li><li><b>maneuver_mean_abs_dcog</b>: 0.074</li><li><b>accel_mean_abs_dsog</b>: 0.050</li><li><b>abs_dlat_24h</b>: 0.034</li><li><b>mean_sog</b>: 0.032</li></ol><h3>Predicting α_18h</h3><ol><li><b>anchor_lat</b>: 0.239</li><li><b>path_km_24h</b>: 0.136</li><li><b>anchor_lon</b>: 0.134</li><li><b>accel_mean_abs_dsog</b>: 0.121</li><li><b>std_sog</b>: 0.115</li><li><b>max_abs_dcog</b>: 0.050</li><li><b>net_disp_km_24h</b>: 0.043</li><li><b>maneuver_mean_abs_dcog</b>: 0.038</li></ol><h3>Predicting α_24h</h3><ol><li><b>anchor_lon</b>: 0.351</li><li><b>anchor_lat</b>: 0.305</li><li><b>std_sog</b>: 0.082</li><li><b>accel_mean_abs_dsog</b>: 0.063</li><li><b>abs_dlat_24h</b>: 0.036</li><li><b>max_abs_dcog</b>: 0.029</li><li><b>maneuver_mean_abs_dcog</b>: 0.026</li><li><b>mean_sog</b>: 0.026</li></ol><h3>Predicting α_24h − α_9h</h3><ol><li><b>anchor_lon</b>: 0.291</li><li><b>anchor_lat</b>: 0.274</li><li><b>std_sog</b>: 0.114</li><li><b>accel_mean_abs_dsog</b>: 0.079</li><li><b>max_abs_dcog</b>: 0.038</li><li><b>straightness</b>: 0.036</li><li><b>abs_dlat_24h</b>: 0.033</li><li><b>mean_sog</b>: 0.030</li></ol>
+</body></html>

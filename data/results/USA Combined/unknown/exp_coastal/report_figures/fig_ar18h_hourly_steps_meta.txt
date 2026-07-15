@@ -1,0 +1,12 @@
+Model: AR LSTM 18h (exp_coastal/AR_18h)
+Hourly markers: every 6 steps = 1 hour (10 min/step)
+Collage: fig_ar18h_hourly_steps_multi.png
+HTML: map_ar18h_hourly_steps.html
+Singles: map_ar18h_hourly_steps/
+
+01. idx=182 FDE=9.8 net=87
+02. idx=107 FDE=49.2 net=345
+03. idx=86 FDE=33.1 net=264
+04. idx=8 FDE=124.6 net=339
+05. idx=131 FDE=134.6 net=127
+06. idx=14 FDE=199.7 net=257

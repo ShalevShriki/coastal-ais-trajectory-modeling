@@ -1,0 +1,19 @@
+Model: AR LSTM 12h (exp_coastal/AR_12h_noland)
+Filter: NON-LOOPED maneuvers only (coastal bends / course changes / U-turns).
+Excluded: tracks that revisit early path (loops/circles) or ultra-low directness loops.
+Folder: /home/projects/crml-prj10844/deep_learning/project/proj/project/data/results/USA Combined/unknown/exp_coastal/report_figures/map_track_pngs_nonloop
+HTML: map_clear_tracks_nonloop.html
+Collage: fig_tracks_nonloop_maneuvers.png
+
+  01. idx=  1  Non-loop U-turn/bend #1 | true 42 km | Δcourse=92° ct=21km | FDE 24.6 km
+  02. idx= 29  Non-loop Coastal bend #2 | true 113 km | Δcourse=88° ct=27km | FDE 40.6 km
+  03. idx=186  Non-loop Coastal bend #3 | true 118 km | Δcourse=61° ct=20km | FDE 61.5 km
+  04. idx=157  Non-loop Coastal bend #4 | true 71 km | Δcourse=55° ct=8km | FDE 55.3 km
+  05. idx= 34  Non-loop Coastal bend #5 | true 83 km | Δcourse=32° ct=14km | FDE 38.9 km
+  06. idx= 85  Non-loop Coastal bend #6 | true 121 km | Δcourse=27° ct=9km | FDE 55.6 km
+  07. idx= 14  Non-loop Coastal bend #7 | true 257 km | Δcourse=66° ct=42km | FDE 170.4 km
+  08. idx= 27  Non-loop U-turn/bend #8 | true 103 km | Δcourse=133° ct=9km | FDE 168.4 km
+  09. idx= 65  Non-loop U-turn/bend #9 | true 101 km | Δcourse=94° ct=42km | FDE 77.0 km
+  10. idx=131  Non-loop Coastal bend #10 | true 127 km | Δcourse=79° ct=39km | FDE 123.0 km
+  11. idx=189  Non-loop Coastal bend #11 | true 88 km | Δcourse=15° ct=15km | FDE 135.9 km
+  12. idx= 22  Non-loop Coastal bend #12 | true 49 km | Δcourse=7° ct=19km | FDE 116.8 km

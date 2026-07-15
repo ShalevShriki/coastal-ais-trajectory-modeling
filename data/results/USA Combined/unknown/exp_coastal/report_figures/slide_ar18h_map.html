@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AR LSTM 18h — Trajectory Map</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a222c;
+      --text: #f2f5f8;
+      --muted: #9aa7b5;
+      --accent: #4fc3f7;
+      --line: #2a3542;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    .slide {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      padding: 18px 22px 14px;
+      gap: 10px;
+    }
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 10px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(22px, 2.4vw, 34px);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .subtitle {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: clamp(13px, 1.2vw, 16px);
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .tabs button {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .tabs button.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+    .map-frame {
+      position: relative;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      background: #111;
+      min-height: 0;
+    }
+    .map-frame iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #fff;
+    }
+    footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.45;
+    }
+    .legend span {
+      display: inline-block;
+      margin-inline-end: 14px;
+      white-space: nowrap;
+    }
+    .swatch {
+      display: inline-block;
+      width: 18px;
+      height: 3px;
+      vertical-align: middle;
+      margin-inline-end: 5px;
+      border-radius: 2px;
+    }
+    .hint { opacity: 0.85; }
+    @media (max-width: 720px) {
+      header { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="slide">
+    <header>
+      <div>
+        <h1>AR LSTM 18h — example trajectories on the map</h1>
+        <p class="subtitle">12h forecast · markers every 1 hour (6 × 10 min steps) · coastal test set</p>
+      </div>
+      <div class="tabs" role="tablist">
+        <button type="button" class="active" data-map="map_ar18h_hourly_steps.html">Hourly steps (6 tracks)</button>
+        <button type="button" data-map="map_ar18h_pred_twists.html">Predicted twists</button>
+      </div>
+    </header>
+
+    <div class="map-frame">
+      <iframe id="map" title="Trajectory map" src="map_ar18h_hourly_steps.html" loading="eager"></iframe>
+    </div>
+
+    <footer>
+      <div class="legend">
+        <span><i class="swatch" style="background:#757575"></i>History</span>
+        <span><i class="swatch" style="background:#1565C0"></i>True future</span>
+        <span><i class="swatch" style="background:#2E7D32; border-bottom: 2px dashed #2E7D32; height:0"></i>Prediction</span>
+        <span>★ NOW · blue +Nh · green P+Nh</span>
+      </div>
+      <div class="hint">Toggle layers inside the map · press F11 for fullscreen</div>
+    </footer>
+  </div>
+
+  <script>
+    const iframe = document.getElementById('map');
+    document.querySelectorAll('.tabs button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tabs button').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        iframe.src = btn.dataset.map;
+      });
+    });
+  </script>
+</body>
+</html>
