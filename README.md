@@ -62,6 +62,7 @@ project/
 │   ├── apply_training_filters.py
 │   ├── filter_inland_windows.py
 │   ├── generate_report_figures.py
+│   ├── diagnose_ar_context.py ← why AR 18h > 24h (occlusion/grads/h)
 │   ├── analyze_adaptive_*.py
 │   ├── plot_ar*_map.py       ← Folium HTML maps
 │   └── …
@@ -349,7 +350,31 @@ python scripts/plot_ar9h_map.py
 
 Defaults point at `exp_coastal` AR runs and coastal parquet. Override with `--input` / trajectory JSON paths as needed.
 
-### 9.3 Adaptive gate analysis
+### 9.3 Why AR 18h beats 24h (occlusion / grads / hidden state)
+
+Reproduces the mentor diagnostics that justify the AR history ranking:
+
+```bash
+source scripts/exp_coastal/_env.sh && cd "$SUBROOT"
+$PYTHON scripts/diagnose_ar_context.py --n-samples 800
+```
+
+What it measures on a shared coastal test subsample for AR 9/12/18/24:
+
+1. **Hidden-state saturation** — hours of recent context to reach 95% cosine with full-history \(h\)
+2. **Occlusion** — Δ median FDE when zeroing the oldest vs newest 3h
+3. **Backprop attribution** — share of \(|\partial L/\partial x_t|\) on newest vs oldest 3h
+4. **Forget-gate bias** — encoder LSTM layer-0 forget bias
+5. **AR24 keep-last-k** — FDE when only the newest \(k\) hours are kept
+
+Writes under `report_figures/`:
+
+- `fig_ar_why_18h_diagnostics.png`
+- `fig_ar_forget_bias.png`
+- `fig_ar_why_18h_meta.txt`
+- `fig_ar_why_18h_summary.json`
+
+### 9.4 Adaptive gate analysis
 
 ```bash
 python scripts/analyze_adaptive_alphas.py
@@ -359,7 +384,7 @@ python scripts/analyze_adaptive_gate_drivers.py
 Defaults read  
 `.../exp_coastal/adaptive_multiscale/RNN_AR_adaptive/context_alpha_weights.json`.
 
-### 9.4 Other utilities
+### 9.5 Other utilities
 
 ```bash
 python scripts/plot_training_history.py --help
