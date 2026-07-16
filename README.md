@@ -12,13 +12,44 @@ We predict **12-hour vessel trajectories** from Automatic Identification System 
 
 **Canonical experiment suite:** `exp_coastal` — USA Combined coastal windows after inland filtering (~363k examples), land penalty λ = 0.1.
 
-**Moodle code ZIP:** see [`SUBMISSION.md`](SUBMISSION.md) (code only; no datasets). Pack with `bash scripts/pack_moodle_zip.sh`.  
-**Exact train args for every report experiment:** [`EXPERIMENTS.md`](EXPERIMENTS.md) · `bash scripts/exp_coastal/reproduce_experiments.sh`
+---
+
+## How to reproduce (start here)
+
+Everything needed to re-run the report experiments is in this **README** (plus `requirements.txt`). Dataset is downloaded automatically from Google Drive.
+
+```bash
+# 1) Unzip Moodle package (or clone GitHub)
+unzip AmitaiGal_ShalevShiriki_046211_code.zip
+cd AmitaiGal_ShalevShiriki_046211_code
+export PYTHONPATH="$(pwd)"    # must be the folder that contains `proj/`
+cd proj/project
+
+# 2) Environment
+pip install -r requirements.txt
+
+# 3) Download processed coastal data (~2.8 GB parquet + land grid)
+python scripts/download_processed_data.py
+# Drive URLs are in data_urls.example.json:
+#   train.parquet  https://drive.google.com/file/d/1Avt0LDK9LAhMmdhULeHwZdKbXXi6-7vy/view?usp=sharing
+#   land_grid      https://drive.google.com/file/d/1aXP3c_M4eAN16I5ltPTreEfnbUfC1_s8/view?usp=sharing
+
+# 4) Print or run the exact training commands used in the report
+bash scripts/exp_coastal/reproduce_experiments.sh            # print ALL CLIs
+bash scripts/exp_coastal/reproduce_experiments.sh --run flat  # Flat LSTM (best FDE)
+bash scripts/exp_coastal/reproduce_experiments.sh --run ar18  # AR LSTM 18h
+# other keys: ar9 ar12 ar24 transformer adaptive sliding sep_hard …
+```
+
+Shared hyperparameters (all main runs unless noted): `--sample 300000`, history as listed, future/horizon `12`, LSTM `256×2` dropout `0.2`, batch `256` (Transformer `128`), lr `1e-3`, epochs `60`, patience `10`, `--no-maneuver-oversample`, `--land-penalty-weight 0.1`.
+
+Full expanded CLIs for every model are in [§6.5](#65-exact-cli-for-each-report-model) below. Slurm wrappers: `scripts/exp_coastal/train_*.sbatch`.
 
 ---
 
 ## Table of contents
 
+0. [How to reproduce (start here)](#how-to-reproduce-start-here)
 1. [Quick facts](#1-quick-facts)
 2. [Repository layout](#2-repository-layout)
 3. [Setup](#3-setup)
@@ -56,17 +87,16 @@ Data source: NOAA AIS
 
 ```
 project/
-├── README.md                 ← this file
-├── SUBMISSION.md             ← Moodle ZIP checklist
+├── README.md                 ← start here (reproduce + all train CLIs)
 ├── requirements.txt / environment.yml
-├── data_urls.example.json    ← paste Drive links → data_urls.json
+├── data_urls.example.json    ← Google Drive links for processed data
 ├── report/                   ← final PDF + TeX + LyX helper markdown
 ├── models/                   ← trainers (+ RNN_AR_diff_encoder.py separate encoders)
 ├── processing/               ← NOAA download / clean / segment / windows
 ├── scripts/
-│   ├── exp_coastal/          ← Slurm jobs for the report suite
+│   ├── exp_coastal/          ← Slurm jobs + reproduce_experiments.sh
 │   ├── download_processed_data.py  ← fetch coastal parquet from Drive
-│   ├── pack_moodle_zip.sh    ← build code-only Moodle ZIP
+│   ├── pack_moodle_zip.sh    ← authors: build code-only Moodle ZIP
 │   ├── combine_datasets.py
 │   ├── apply_training_filters.py
 │   ├── filter_inland_windows.py
@@ -269,18 +299,16 @@ sbatch scripts/exp_coastal/filter_inland.sbatch
 
 ## 6. Training (`exp_coastal`)
 
-**All expanded CLI arguments** for every report model are collected in [`EXPERIMENTS.md`](EXPERIMENTS.md).  
-To print or run them locally:
+Use [How to reproduce](#how-to-reproduce-start-here) first. The helper below prints/runs the **same flags** as `scripts/exp_coastal/train_*.sbatch`:
 
 ```bash
 bash scripts/exp_coastal/reproduce_experiments.sh            # print all
 bash scripts/exp_coastal/reproduce_experiments.sh --run flat  # Flat LSTM
 bash scripts/exp_coastal/reproduce_experiments.sh --run ar18  # AR 18h
+bash scripts/exp_coastal/reproduce_experiments.sh --run all   # full suite (long)
 ```
 
-Those flags match `scripts/exp_coastal/train_*.sbatch` (the Slurm jobs used for the report).
-
-### 6.1 Submit the full suite (recommended)
+### 6.1 Submit the full suite on Slurm (optional)
 
 ```bash
 bash scripts/exp_coastal/submit_all.sh
@@ -331,6 +359,95 @@ python -u models/RNN_AR.py \
 | Report figures & HTML maps | `data/results/USA Combined/unknown/exp_coastal/report_figures/` |
 
 Typical result artifacts per run: `*_metrics.json`, `*_sample_trajectories.json`, training-history / scatter / error-hist PNGs.
+
+### 6.5 Exact CLI for each report model
+
+Shared defaults: `--sample 300000`, `--future-hours 12`, `--horizon-hours 12`, LSTM `256×2` / dropout `0.2`, batch `256`, lr `1e-3`, epochs `60`, patience `10`, `--no-maneuver-oversample`, `--land-penalty-weight 0.1` (Transformer: `d-model 128`, batch `128`).
+
+**AR LSTM 9 / 12 / 18 / 24 h** — change `--history-hours` and `--run-tag` (`AR_9h` … `AR_24h`):
+
+```bash
+python -u models/RNN_AR.py --coast "USA Combined" \
+  --input data/processed/combined_filtered_smart_coastal/train.parquet \
+  --run-tag exp_coastal/AR_18h \
+  --sample 300000 --history-hours 18 --future-hours 12 --horizon-hours 12 \
+  --rnn-type lstm --hidden-dim 256 --num-layers 2 --dropout 0.2 \
+  --batch-size 256 --lr 1e-3 --teacher-forcing 0.3 --epochs 60 --patience 10 \
+  --no-maneuver-oversample --target-mode anchor_offset \
+  --land-penalty-weight 0.1
+```
+
+**Flat LSTM** (best median FDE):
+
+```bash
+python -u models/RNN.py --coast "USA Combined" \
+  --input data/processed/combined_filtered_smart_coastal/train.parquet \
+  --run-tag exp_coastal/flat_lstm \
+  --sample 300000 --history-hours 24 --future-hours 12 --horizon-hours 12 \
+  --rnn-type lstm --hidden-dim 256 --num-layers 2 --dropout 0.2 \
+  --batch-size 256 --lr 1e-3 --epochs 60 --patience 10 \
+  --no-maneuver-oversample --no-curriculum \
+  --land-penalty-weight 0.1
+```
+
+**Transformer:**
+
+```bash
+python -u models/transformers.py --coast "USA Combined" \
+  --input data/processed/combined_filtered_smart_coastal/train.parquet \
+  --run-tag exp_coastal/transformer \
+  --sample 300000 --history-hours 24 --future-hours 12 --horizon-hours 12 \
+  --d-model 128 --nhead 8 --num-encoder-layers 4 --dim-feedforward 512 --dropout 0.1 \
+  --batch-size 128 --lr 1e-3 --weight-decay 1e-4 --epochs 60 --patience 10 \
+  --no-maneuver-oversample --no-curriculum \
+  --land-penalty-weight 0.1
+```
+
+**Shared-encoder Adaptive AR:**
+
+```bash
+python -u models/RNN_AR_adaptive.py --coast "USA Combined" \
+  --input data/processed/combined_filtered_smart_coastal/train.parquet \
+  --run-tag exp_coastal/adaptive_multiscale \
+  --sample 300000 --future-hours 12 --horizon-hours 12 \
+  --rnn-type lstm --hidden-dim 256 --num-layers 2 --dropout 0.2 \
+  --batch-size 256 --lr 1e-3 --teacher-forcing 0.3 --epochs 60 --patience 10 \
+  --no-maneuver-oversample \
+  --land-penalty-weight 0.1
+```
+
+**Sliding 3h×4:**
+
+```bash
+python -u models/RNN_recursive_1h.py --coast "USA Combined" \
+  --input data/processed/combined_filtered_smart_coastal/train.parquet \
+  --run-tag exp_coastal/sliding_3h \
+  --sample 300000 --chunk-hours 3 --horizon-hours 12 \
+  --rnn-type lstm --hidden-dim 256 --num-layers 2 --dropout 0.2 \
+  --batch-size 256 --lr 1e-3 --epochs 60 --patience 10 \
+  --no-maneuver-oversample --no-curriculum \
+  --land-penalty-weight 0.1
+```
+
+**Ablation AR 12h no land:** same as AR 12h with `--run-tag exp_coastal/AR_12h_noland` and `--land-penalty-weight 0.0`.
+
+**Separate-encoder adaptive (hard):**
+
+```bash
+python -u models/RNN_AR_diff_encoder.py --coast "USA Combined" \
+  --input data/processed/combined_filtered_smart_coastal/train.parquet \
+  --run-tag exp_coastal/adaptive_separate_encoders_hard \
+  --gate-mode hard \
+  --sample 300000 --future-hours 12 --horizon-hours 12 \
+  --hidden-dim 256 --num-layers 2 --dropout 0.2 \
+  --batch-size 256 --lr 1e-3 --teacher-forcing 0.3 --epochs 60 --patience 10 \
+  --no-maneuver-oversample \
+  --land-penalty-weight 0.1
+```
+
+Softmax variant: `--gate-mode softmax` and `--run-tag exp_coastal/adaptive_separate_encoders_softmax`.
+
+Or print every command in one shot: `bash scripts/exp_coastal/reproduce_experiments.sh`.
 
 ---
 
@@ -532,6 +649,9 @@ python -m http.server 8765
 | `data/processed/land_grid_us.npz` | Land penalty grid |
 | `data/results/.../exp_coastal/*/…_metrics.json` | Per-model metrics |
 | `data/results/.../exp_coastal/report_figures/` | Figures + HTML maps |
+| `scripts/exp_coastal/reproduce_experiments.sh` | Print/run exact report train CLIs |
+| `scripts/download_processed_data.py` | Fetch coastal parquet + land grid from Drive |
+| `data_urls.example.json` | Public Google Drive URLs for processed data |
 | `models/RNN_AR_diff_encoder.py` | Separate-encoder adaptive (softmax / hard) |
 | `scripts/forensics_adaptive_hard.py` | Shared vs separate+hard forensics |
 | `scripts/compare_adaptive_separate_gates.py` | Softmax vs hard comparison table |

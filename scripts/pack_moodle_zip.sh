@@ -21,6 +21,7 @@ rsync -a \
   --exclude '*.ckpt' \
   --exclude '*.parquet' \
   --exclude 'data_urls.json' \
+  --exclude 'SUBMISSION.md' \
   --exclude '.cursor/' \
   --exclude 'AmitaiGal_ShalevShiriki_046211_code.zip' \
   "$ROOT/" "$STAGING/$NAME/proj/project/"
