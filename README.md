@@ -12,7 +12,8 @@ We predict **12-hour vessel trajectories** from Automatic Identification System 
 
 **Canonical experiment suite:** `exp_coastal` — USA Combined coastal windows after inland filtering (~363k examples), land penalty λ = 0.1.
 
-**Moodle code ZIP:** see [`SUBMISSION.md`](SUBMISSION.md) (code only; no datasets). Pack with `bash scripts/pack_moodle_zip.sh`.
+**Moodle code ZIP:** see [`SUBMISSION.md`](SUBMISSION.md) (code only; no datasets). Pack with `bash scripts/pack_moodle_zip.sh`.  
+**Exact train args for every report experiment:** [`EXPERIMENTS.md`](EXPERIMENTS.md) · `bash scripts/exp_coastal/reproduce_experiments.sh`
 
 ---
 
@@ -267,6 +268,17 @@ sbatch scripts/exp_coastal/filter_inland.sbatch
 ---
 
 ## 6. Training (`exp_coastal`)
+
+**All expanded CLI arguments** for every report model are collected in [`EXPERIMENTS.md`](EXPERIMENTS.md).  
+To print or run them locally:
+
+```bash
+bash scripts/exp_coastal/reproduce_experiments.sh            # print all
+bash scripts/exp_coastal/reproduce_experiments.sh --run flat  # Flat LSTM
+bash scripts/exp_coastal/reproduce_experiments.sh --run ar18  # AR 18h
+```
+
+Those flags match `scripts/exp_coastal/train_*.sbatch` (the Slurm jobs used for the report).
 
 ### 6.1 Submit the full suite (recommended)
 

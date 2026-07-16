@@ -32,5 +32,8 @@ export PYTHONPATH="$(pwd)"          # parent of proj/
 cd proj/project
 pip install -r requirements.txt
 python scripts/download_processed_data.py
-# then train, e.g. Flat LSTM / AR 18h — see README §6
+# Exact args for every report experiment:
+bash scripts/exp_coastal/reproduce_experiments.sh            # print
+bash scripts/exp_coastal/reproduce_experiments.sh --run flat  # or ar18, all, …
+# Full list: EXPERIMENTS.md
 ```
