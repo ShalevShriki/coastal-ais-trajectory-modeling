@@ -53,8 +53,8 @@ Data source: NOAA AIS
 project/
 ├── README.md                 ← this file
 ├── requirements.txt
-├── report/                   ← final PDF + TeX
-├── models/                   ← trainers + shared training helpers
+├── report/                   ← final PDF + TeX + LyX helper markdown
+├── models/                   ← trainers (+ RNN_AR_diff_encoder.py separate encoders)
 ├── processing/               ← NOAA download / clean / segment / windows
 ├── scripts/
 │   ├── exp_coastal/          ← Slurm jobs for the report suite
@@ -63,6 +63,8 @@ project/
 │   ├── filter_inland_windows.py
 │   ├── generate_report_figures.py
 │   ├── diagnose_ar_context.py ← why AR 18h > 24h (occlusion/grads/h)
+│   ├── compare_adaptive_separate_gates.py
+│   ├── forensics_adaptive_hard.py ← separate+hard vs shared adaptive
 │   ├── analyze_adaptive_*.py
 │   ├── plot_ar*_map.py       ← Folium HTML maps
 │   └── …
@@ -129,6 +131,25 @@ Each row in the parquet is one sliding window:
 Ranking in the report uses **median FDE** (errors are heavy-tailed). We also report mean FDE and median ADE.
 
 Train/val/test are split by **`traj_id`** (fallback: MMSI) to avoid leakage across overlapping windows of the same voyage.
+
+### Motion buckets (straight vs maneuver)
+
+Used **only for analysis / stratified metrics** (e.g. history-length vs motion type in the report). **Not** a training label. Features come from the **observed history only** (no future / label leakage).
+
+Canonical implementation: `window_data.classify_window_motion` / `motion_bucket_masks_df`.
+
+| Bucket | Rule (history window) |
+|--------|------------------------|
+| **Anchored** | mean SOG \< 1 kn |
+| **Maneuver** | max \|ΔCOG\| \> **15°** |
+| **Straight** | mean SOG ≥ **5 kn** and max \|ΔCOG\| \< **5°**, and not anchored |
+| **Other** | everything else (ambiguous; excluded from the straight-vs-maneuver comparison) |
+
+The report also describes path **straightness** \(d_{\mathrm{direct}} / L_{\mathrm{path}}\) as intuition; the **code thresholds above** are what actually define the metric buckets.
+
+**Separate heuristic:** `scripts/generate_report_figures.py` picks example tracks for Folium/gallery maps with path directness + turn distance. That is only for visualization diversity, not the same as the metric buckets.
+
+Optional training-time oversampling (`--maneuver-fraction`, `--straight-fraction`, or `--no-maneuver-oversample`) can bias which windows enter the train subsample; `exp_coastal` runs use `--no-maneuver-oversample`.
 
 ---
 
@@ -229,6 +250,7 @@ This chains: inland filter → AR 9h → 12h → 18h → 24h → Flat LSTM → T
 | Flat LSTM | `train_flat_lstm.sbatch` |
 | Transformer | `train_transformer.sbatch` |
 | Adaptive multi-scale AR | `train_adaptive.sbatch` |
+| Separate-encoder adaptive (softmax / hard) | `train_adaptive_separate_{softmax,hard}.sbatch` · `submit_adaptive_separate.sh` |
 | Sliding 3h × 4 | `train_sliding_3h.sbatch` |
 | Ablation: AR 12h, no land penalty | `train_AR_12h_noland.sbatch` |
 
@@ -274,7 +296,8 @@ Typical result artifacts per run: `*_metrics.json`, `*_sample_trajectories.json`
 | **Flat LSTM** | `models/RNN.py` | Direct 72-step forecast (no AR unroll) |
 | **Transformer** | `models/transformers.py` | Self-attention over 24h history |
 | **Sliding 3h×4** | `models/RNN_recursive_1h.py` | Short predictor rolled to 12h |
-| **Adaptive multi-scale AR** | `models/RNN_AR_adaptive.py` | Soft gate over 9+12+18+24h encodings |
+| **Adaptive multi-scale AR** | `models/RNN_AR_adaptive.py` | Soft gate over 9+12+18+24h encodings (shared encoder) |
+| **Separate-encoder adaptive** | `models/RNN_AR_diff_encoder.py` | Four independent encoders + gate (`--gate-mode softmax\|hard`) |
 
 Shared helpers:
 
@@ -303,14 +326,19 @@ Coastal test set, λ_land = 0.1. Distances in **km**.
 | **Flat LSTM** | 144 | 0.91M | **18.80** | **35.26** | 7.72 |
 | Transformer | 144 | ~1.00M | 19.40 | 36.81 | 8.24 |
 | Sliding 3h×4 | rolled | 0.84M | 22.44 | 39.35 | 7.61 |
-| Adaptive AR | 9+12+18+24 | 1.90M | 20.19 | 36.70 | 7.64 |
+| Adaptive AR (shared encoder) | 9+12+18+24 | 1.90M | 20.19 | 36.70 | 7.64 |
+| Separate encoders + **hard** gate | 9+12+18+24 | 4.31M | **19.08** | 36.90 | 11.38 |
+| Separate encoders + softmax gate | 9+12+18+24 | 4.31M | 21.00 | 37.70 | 12.38 |
+
+Softmax separate-encoder collapsed to **9h (~99%)** and underperformed; hard selection spreads over 9/12/24h (~29/37/34%) and never uses 18h. Report comparison focuses on **shared vs separate+hard**.
 
 **Takeaways (aligned with the report):**
 
 1. Neural models cut median FDE from ~102 km to ~19–20 km.  
 2. **Flat LSTM** is best overall median FDE.  
 3. In the fixed AR sweep, **18h beats 24h** — useful AR context saturates (~12–15h); older history acts mostly as noise.  
-4. **Adaptive gating** does not beat simpler models; the gate collapses toward long context with nearly redundant nested encodings.
+4. Shared-encoder **adaptive gating** does not beat simpler models; the gate collapses toward long context with nearly redundant nested encodings.  
+5. **Separate encoders + hard gate** improve on shared adaptive (20.19 → 19.08 median FDE) by making context states distinct, but still trail Flat LSTM (18.80) at ~2.3× the parameters.
 
 ---
 
@@ -384,7 +412,45 @@ python scripts/analyze_adaptive_gate_drivers.py
 Defaults read  
 `.../exp_coastal/adaptive_multiscale/RNN_AR_adaptive/context_alpha_weights.json`.
 
-### 9.5 Other utilities
+### 9.5 Separate-encoder adaptive gates (softmax vs hard)
+
+Model: `models/RNN_AR_diff_encoder.py` — four **independent** LSTM encoders (9/12/18/24h), shared gate MLP + AR decoder; same loss/data as the coastal suite. Does **not** modify `RNN_AR.py` / `RNN_AR_adaptive.py`.
+
+```bash
+source scripts/exp_coastal/_env.sh && cd "$SUBROOT"
+bash scripts/exp_coastal/submit_adaptive_separate.sh   # both jobs in parallel
+# or individually:
+sbatch scripts/exp_coastal/train_adaptive_separate_softmax.sbatch
+sbatch scripts/exp_coastal/train_adaptive_separate_hard.sbatch
+```
+
+| Kind | Path |
+|------|------|
+| Checkpoints | `data/models/.../exp_coastal/adaptive_separate_encoders_{softmax,hard}/` |
+| Metrics / plots | `data/results/.../exp_coastal/adaptive_separate_encoders_{softmax,hard}/RNN_AR_diff_encoder/` |
+| Comparison table | `data/results/.../exp_coastal/adaptive_separate_encoders_comparison.md` |
+| LyX inserts | `report/chatgpt_adaptive_*.md` |
+
+After training:
+
+```bash
+python scripts/compare_adaptive_separate_gates.py
+python scripts/forensics_adaptive_hard.py   # shared vs separate+hard diagnostics
+```
+
+Forensics figures under `report_figures/`:
+
+- `fig_adaptive_separate_vs_shared_fde.png`
+- `fig_adaptive_separate_selection.png`
+- `fig_adaptive_separate_hidden_cos.png`
+- `fig_adaptive_hard_forced_vs_selected.png`
+- `fig_adaptive_hard_selection_by_motion.png`
+- `fig_adaptive_hard_grad_by_hour.png`
+- `fig_adaptive_hard_forget_bias.png`
+- `fig_adaptive_hard_encoder_l2.png`
+- `fig_adaptive_hard_forensics_meta.json`
+
+### 9.6 Other utilities
 
 ```bash
 python scripts/plot_training_history.py --help
@@ -419,6 +485,10 @@ python -m http.server 8765
 | `data/processed/land_grid_us.npz` | Land penalty grid |
 | `data/results/.../exp_coastal/*/…_metrics.json` | Per-model metrics |
 | `data/results/.../exp_coastal/report_figures/` | Figures + HTML maps |
+| `models/RNN_AR_diff_encoder.py` | Separate-encoder adaptive (softmax / hard) |
+| `scripts/forensics_adaptive_hard.py` | Shared vs separate+hard forensics |
+| `scripts/compare_adaptive_separate_gates.py` | Softmax vs hard comparison table |
+| `report/chatgpt_adaptive_hard_forensics_report.md` | LyX insert for hard-gate forensics |
 
 ---
 
