@@ -132,14 +132,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$MODE" == "print" ]]; then
+  if [[ ! -f "$DATA" ]]; then
+    echo "# Note: $DATA not found yet — run: python scripts/download_processed_data.py" >&2
+  fi
+  print_all
+  exit 0
+fi
+
 if [[ ! -f "$DATA" ]]; then
   echo "Missing $DATA — run: python scripts/download_processed_data.py" >&2
   exit 1
-fi
-
-if [[ "$MODE" == "print" ]]; then
-  print_all
-  exit 0
 fi
 
 case "$TARGET" in
