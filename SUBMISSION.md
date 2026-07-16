@@ -11,13 +11,17 @@ Course reminder ([Moodle forum](https://moodle25.technion.ac.il/mod/forum/discus
 | `requirements.txt` | Present (optional `environment.yml`) |
 | GitHub (encouraged) | https://github.com/ShalevShriki/coastal-ais-trajectory-modeling |
 
+## Dataset Drive links (public)
+
+- `train.parquet`: https://drive.google.com/file/d/1Avt0LDK9LAhMmdhULeHwZdKbXXi6-7vy/view?usp=sharing
+- `land_grid_us.npz`: https://drive.google.com/file/d/1aXP3c_M4eAN16I5ltPTreEfnbUfC1_s8/view?usp=sharing
+
+These are embedded in `data_urls.example.json` (shipped in the ZIP).
+
 ## Before uploading to Moodle
 
-1. Upload these two files to Google Drive (Anyone with the link → Viewer):
-   - `data/processed/combined_filtered_smart_coastal/train.parquet` (~2.8 GB)
-   - `data/processed/land_grid_us.npz` (~14 KB)
-2. Copy `data_urls.example.json` → `data_urls.json` and paste the share links.
-3. Run `bash scripts/pack_moodle_zip.sh` and upload the ZIP under the Moodle project section.
+1. Run `bash scripts/pack_moodle_zip.sh`
+2. Upload `AmitaiGal_ShalevShiriki_046211_code.zip` under the Moodle project section
 
 Graders then:
 

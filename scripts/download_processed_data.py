@@ -101,14 +101,19 @@ def main() -> None:
         )
         return
 
-    if not args.urls.exists():
+    urls_path = args.urls
+    if not urls_path.exists():
         example = PROJECT / "data_urls.example.json"
-        raise SystemExit(
-            f"Missing {args.urls}. Copy {example.name} → data_urls.json "
-            "and paste Google Drive (or HTTPS) URLs for the processed files."
-        )
+        if example.exists():
+            print(f"[info] {urls_path.name} missing — using {example.name}")
+            urls_path = example
+        else:
+            raise SystemExit(
+                f"Missing {args.urls}. Copy data_urls.example.json → data_urls.json "
+                "and paste Google Drive (or HTTPS) URLs for the processed files."
+            )
 
-    urls = json.loads(args.urls.read_text(encoding="utf-8"))
+    urls = json.loads(urls_path.read_text(encoding="utf-8"))
     download(urls.get("combined_filtered_smart_coastal_train_parquet", ""), OUT_PARQUET, args.force)
     download(urls.get("land_grid_us_npz", ""), OUT_LAND, args.force)
     print("Done. Point training at:")

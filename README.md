@@ -111,13 +111,18 @@ The Moodle ZIP / GitHub code tree does **not** ship the ~2.8 GB training parquet
 
 **A. Recommended — download our processed coastal artifacts**
 
-1. Authors host `train.parquet` + `land_grid_us.npz` on Google Drive (links in `data_urls.json`; template: `data_urls.example.json`).
+1. Authors host `train.parquet` + `land_grid_us.npz` on Google Drive (links already in `data_urls.example.json`).
 2. Graders / reproducers:
 
 ```bash
-cp data_urls.example.json data_urls.json   # if needed, paste Drive share links
 python scripts/download_processed_data.py
+# uses data_urls.json if present, else data_urls.example.json
 ```
+
+Drive links:
+
+- parquet: https://drive.google.com/file/d/1Avt0LDK9LAhMmdhULeHwZdKbXXi6-7vy/view?usp=sharing
+- land grid: https://drive.google.com/file/d/1aXP3c_M4eAN16I5ltPTreEfnbUfC1_s8/view?usp=sharing
 
 This writes:
 
