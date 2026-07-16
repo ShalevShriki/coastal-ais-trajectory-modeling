@@ -10,3 +10,5 @@ pyproj
 scikit-learn
 torch
 global-land-mask
+scipy
+gdown

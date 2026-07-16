@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy to data_urls.json and replace with your Google Drive share links (or any direct HTTPS URLs). Then run: python scripts/download_processed_data.py",
+  "combined_filtered_smart_coastal_train_parquet": "https://drive.google.com/uc?id=YOUR_FILE_ID_HERE",
+  "land_grid_us_npz": "https://drive.google.com/uc?id=YOUR_FILE_ID_HERE"
+}

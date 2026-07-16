@@ -1,0 +1,22 @@
+name: coastal-ais-trajectory
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - pip
+  - pandas
+  - numpy
+  - pyarrow
+  - matplotlib
+  - scikit-learn
+  - requests
+  - zstandard
+  - scipy
+  - pip:
+      - torch
+      - folium
+      - contextily
+      - pyproj
+      - global-land-mask
+      - gdown

@@ -4,11 +4,15 @@ Technion course **046211 — Deep Learning** final project.
 
 Authors: **Amitai Gal**, **Shalev Shiriki**
 
+**GitHub (public):** https://github.com/ShalevShriki/coastal-ais-trajectory-modeling
+
 We predict **12-hour vessel trajectories** from Automatic Identification System (AIS) history, and study a core sequence-learning question: **how much temporal context is useful**, and whether a more complex adaptive model uses long history better than simpler fixed-context models.
 
 **Submitted report:** [`report/AIS_report.pdf`](report/AIS_report.pdf) · TeX source [`report/AIS_report.tex`](report/AIS_report.tex)
 
 **Canonical experiment suite:** `exp_coastal` — USA Combined coastal windows after inland filtering (~363k examples), land penalty λ = 0.1.
+
+**Moodle code ZIP:** see [`SUBMISSION.md`](SUBMISSION.md) (code only; no datasets). Pack with `bash scripts/pack_moodle_zip.sh`.
 
 ---
 
@@ -52,12 +56,16 @@ Data source: NOAA AIS
 ```
 project/
 ├── README.md                 ← this file
-├── requirements.txt
+├── SUBMISSION.md             ← Moodle ZIP checklist
+├── requirements.txt / environment.yml
+├── data_urls.example.json    ← paste Drive links → data_urls.json
 ├── report/                   ← final PDF + TeX + LyX helper markdown
 ├── models/                   ← trainers (+ RNN_AR_diff_encoder.py separate encoders)
 ├── processing/               ← NOAA download / clean / segment / windows
 ├── scripts/
 │   ├── exp_coastal/          ← Slurm jobs for the report suite
+│   ├── download_processed_data.py  ← fetch coastal parquet from Drive
+│   ├── pack_moodle_zip.sh    ← build code-only Moodle ZIP
 │   ├── combine_datasets.py
 │   ├── apply_training_filters.py
 │   ├── filter_inland_windows.py
@@ -86,19 +94,41 @@ project/
 ## 3. Setup
 
 ```bash
-cd /path/to/proj/project
-pip install -r requirements.txt
+# After unzipping the Moodle package (or cloning GitHub), PYTHONPATH = parent of `proj/`
+# Moodle ZIP layout:  <zip_root>/proj/project/...
+export PYTHONPATH=/path/to/zip_root          # directory that contains `proj/`
+cd /path/to/zip_root/proj/project
 
-# IMPORTANT: PYTHONPATH must point at the *parent* of `proj/`
-# so `import proj.project.window_data` works.
-export PYTHONPATH=/path/to/project   # e.g. .../deep_learning/project
+pip install -r requirements.txt
+# or: conda env create -f environment.yml && conda activate coastal-ais-trajectory
 ```
 
-Dependencies (see `requirements.txt`): `pandas`, `numpy`, `torch`, `scikit-learn`, `pyarrow`, `matplotlib`, `folium`, `contextily`, `pyproj`, `requests`, `zstandard`, `global-land-mask`.
+Dependencies: see `requirements.txt` / `environment.yml` (`pandas`, `numpy`, `torch`, `scikit-learn`, `pyarrow`, `matplotlib`, `folium`, `contextily`, `pyproj`, `requests`, `zstandard`, `global-land-mask`, `scipy`, `gdown`).
 
-### Cluster paths
+### 3.1 Get the processed coastal dataset (required for training)
 
-Slurm scripts source `scripts/exp_coastal/_env.sh`, which sets absolute paths for this Technion project tree and:
+The Moodle ZIP / GitHub code tree does **not** ship the ~2.8 GB training parquet. Two options:
+
+**A. Recommended — download our processed coastal artifacts**
+
+1. Authors host `train.parquet` + `land_grid_us.npz` on Google Drive (links in `data_urls.json`; template: `data_urls.example.json`).
+2. Graders / reproducers:
+
+```bash
+cp data_urls.example.json data_urls.json   # if needed, paste Drive share links
+python scripts/download_processed_data.py
+```
+
+This writes:
+
+- `data/processed/combined_filtered_smart_coastal/train.parquet`
+- `data/processed/land_grid_us.npz`
+
+**B. Rebuild from public NOAA AIS** (multi-day) — see [§5](#5-data-pipeline-from-scratch).
+
+### 3.2 Cluster paths (Technion Slurm)
+
+Slurm scripts source `scripts/exp_coastal/_env.sh`. On a fresh machine, set `PROJECT` / `SUBROOT` to your clone, or run the `python -u models/...` commands from §6.3 directly. Defaults used by `exp_coastal`:
 
 ```bash
 DATA=data/processed/combined_filtered_smart_coastal/train.parquet
@@ -108,8 +138,6 @@ FUTURE_H=12
 HORIZON_H=12
 LAND_PENALTY=0.1
 ```
-
-If you move the repo, edit `_env.sh` (and the `#SBATCH --output=.../LOG/...` lines) accordingly.
 
 ---
 
@@ -154,6 +182,8 @@ Optional training-time oversampling (`--maneuver-fraction`, `--straight-fraction
 ---
 
 ## 5. Data pipeline (from scratch)
+
+Prefer [§3.1](#31-get-the-processed-coastal-dataset-required-for-training) unless you need to regenerate windows.
 
 Run steps in order. Already-processed data for the report lives under `data/processed/` (coasts + `combined_filtered_smart` + `combined_filtered_smart_coastal`).
 

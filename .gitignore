@@ -16,6 +16,7 @@ data/results/**/*.log
 *.parquet
 *.json
 !data/results/**/*.json
+!data_urls.example.json
 *.pkl
 *.npy
 *.npz
@@ -48,3 +49,8 @@ old_versions/logs/
 # System
 .DS_Store
 .env
+
+# Moodle packaging
+AmitaiGal_ShalevShiriki_046211_code.zip
+data_urls.json
+
