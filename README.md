@@ -1,10 +1,9 @@
 # AIS Vessel Trajectory Prediction
+**GitHub:** https://github.com/ShalevShriki/coastal-ais-trajectory-modeling
 
 Technion course **046211 — Deep Learning** final project.
 
 Authors: **Amitai Gal**, **Shalev Shiriki**
-
-**GitHub (public):** https://github.com/ShalevShriki/coastal-ais-trajectory-modeling
 
 We predict **12-hour vessel trajectories** from Automatic Identification System (AIS) history, and study a core sequence-learning question: **how much temporal context is useful**, and whether a more complex adaptive model uses long history better than simpler fixed-context models.
 
